@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.pem
+*.log
+memory/
+.plugin-manager/
+Thumbs.db
+desktop.ini
+.DS_Store

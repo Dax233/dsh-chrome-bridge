@@ -1,0 +1,42 @@
+{
+  "name": "@local/dsh-chrome-bridge",
+  "version": "0.1.24",
+  "private": true,
+  "type": "module",
+  "description": "Host bridge for the DSH Chrome extension: a loopback WebSocket server plus a `chrome` tool that drives the user's real Chrome tabs through chrome.debugger.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "ws.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json",
+    "icon.svg",
+    "extensions/**",
+    "scripts/**"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "test": "node --test tests/ws-bridge.test.mjs tests/chrome-bridge-host.test.mjs tests/chrome-extension-controller.test.mjs tests/chrome-extension-manifest.test.mjs tests/crx-pack.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dax233/dsh-chrome-bridge.git"
+  },
+  "homepage": "https://github.com/Dax233/dsh-chrome-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/Dax233/dsh-chrome-bridge/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

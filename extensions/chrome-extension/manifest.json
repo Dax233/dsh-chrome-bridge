@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "DSH Chrome Bridge",
+  "version": "0.1.24",
+  "description": "Lets the DeepSeek Harness agent drive the user's real Chrome tabs through chrome.debugger, including background tabs.",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_page": "options.html",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ]
+}

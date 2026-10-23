@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Chrome control bridge">
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#0f3d2e"/>
+  <circle cx="32" cy="30" r="15" fill="none" stroke="#e5f3ec" stroke-width="2.6"/>
+  <circle cx="32" cy="30" r="5.4" fill="#e5f3ec"/>
+  <path d="M19 22h26M22 38h20" stroke="#e5f3ec" stroke-width="2.2" opacity="0.65"/>
+  <path d="M41 45l6 6-2.6.6 1.6 3.4-2.2 1-1.6-3.4-2 1.6z" fill="#fbbf24" stroke="#0f172a" stroke-width="1"/>
+</svg>

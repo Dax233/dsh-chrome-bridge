@@ -1,0 +1,3 @@
+- insert:
+    - id: chrome-bridge
+      name: '@local/dsh-chrome-bridge'
