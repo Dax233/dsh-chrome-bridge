@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome Control Bridge",
+    "description": "Connects the DSH agent to the user's real Chrome through the companion extension (chrome.debugger), including background tabs."
+  }
+}

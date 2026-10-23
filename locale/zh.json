@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome 控制桥",
+    "description": "让 Agent 通过配套 Chrome 扩展（chrome.debugger）控制用户的真实 Chrome 标签页，包含后台标签页。"
+  }
+}
