@@ -17,6 +17,17 @@ dsh plugin --profile desktop add github:Dax233/dsh-chrome-bridge
 
 然后在 Chrome 打开 `chrome://extensions` → 开发者模式 → **加载已解压的扩展程序**，选择本仓库的 `extensions/chrome-extension` 目录；打开扩展选项页确认端口/token（默认端口 `47835`，默认 token `dsh-chrome-bridge-local`）。
 
+## Release / 下载安装
+
+GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手动 dispatch 时生成）：
+
+- `dsh-chrome-bridge-v<version>.zip`（推荐）：解压后在 `chrome://extensions` 开开发者模式 → **加载已解压的扩展程序**。
+- `dsh-chrome-bridge-v<version>.crx`：自签名包，仅适用于企业策略/Chromium 开发版；Chrome 稳定版会拒绝拖入安装。
+
+扩展 ID 默认随构建签名 key 变化。若需要稳定 ID（例如企业策略分发），在仓库 Secrets 中设置 `CRX_PRIVATE_KEY` 为签名私钥 PEM：workflow 会优先使用它。**私钥不要提交到仓库。**
+
+手动触发：Actions → release → Run workflow；或 `git push origin v<version>`。
+
 ## 工具面
 
 `chrome(action)`：`status`、`tabs`、`newTab`、`closeTab`、`attach`、`detach`、`navigate`、`snapshot`、`click`、`type`、`key`、`scroll`、`screenshot`、`logs`、`upload`、`evaluate`、`wait`。

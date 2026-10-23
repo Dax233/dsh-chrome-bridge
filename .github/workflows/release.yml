@@ -1,0 +1,70 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Test
+        run: npm test
+
+      - name: Prepare optional stable signing key
+        env:
+          CRX_PRIVATE_KEY: ${{ secrets.CRX_PRIVATE_KEY }}
+        run: |
+          mkdir -p dist
+          if [ -n "$CRX_PRIVATE_KEY" ]; then
+            printf '%s\n' "$CRX_PRIVATE_KEY" > dist/dsh-chrome-bridge.pem
+            chmod 600 dist/dsh-chrome-bridge.pem
+            echo "using repository signing key (stable extension id)"
+          else
+            echo "no CRX_PRIVATE_KEY secret; generating an ephemeral key (extension id changes per build)"
+          fi
+
+      - name: Pack extension
+        id: pack
+        run: |
+          node scripts/pack-crx.mjs
+          VERSION=$(node -e "console.log(require('./extensions/chrome-extension/manifest.json').version)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          cp dist/dsh-chrome-bridge.crx "dist/dsh-chrome-bridge-v${VERSION}.crx"
+          cp dist/dsh-chrome-bridge.zip "dist/dsh-chrome-bridge-v${VERSION}.zip"
+          ls -l dist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-chrome-bridge-extension-${{ steps.pack.outputs.version }}
+          path: |
+            dist/dsh-chrome-bridge-v*.crx
+            dist/dsh-chrome-bridge-v*.zip
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.pack.outputs.version }}
+        run: |
+          TAG="v$VERSION"
+          NOTES="Unpacked ZIP (recommended): unzip, open chrome://extensions, enable Developer mode, Load unpacked. The CRX is self-signed; Chrome stable refuses drag-install (CRX_REQUIRED_PROOF_MISSING) and it is only for enterprise policy or Chromium dev builds."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/dsh-chrome-bridge-v$VERSION.crx" "dist/dsh-chrome-bridge-v$VERSION.zip" --clobber
+          else
+            gh release create "$TAG" \
+              "dist/dsh-chrome-bridge-v$VERSION.crx#Self-signed CRX (enterprise/Chromium only)" \
+              "dist/dsh-chrome-bridge-v$VERSION.zip#Unpacked extension ZIP (recommended)" \
+              --title "dsh-chrome-bridge v$VERSION" \
+              --notes "$NOTES"
+          fi
