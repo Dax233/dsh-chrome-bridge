@@ -25,7 +25,7 @@
       "patch": "./cordis.patch.yml"
     }
   },
-  "license": "AGPL-3.0-or-later",
+  "license": "MIT",
   "scripts": {
     "test": "node --test tests/ws-bridge.test.mjs tests/chrome-bridge-host.test.mjs tests/chrome-extension-controller.test.mjs tests/chrome-extension-manifest.test.mjs tests/crx-pack.test.mjs"
   },
