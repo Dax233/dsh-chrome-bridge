@@ -40,3 +40,5 @@ npm test
 ## License
 
 AGPL-3.0-or-later
+
+详细设计（安全、快照、settle、iframe、ACL 等）：见 [docs/browser-control.md](docs/browser-control.md)。

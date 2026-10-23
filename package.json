@@ -17,7 +17,8 @@
     "locale/*.json",
     "icon.svg",
     "extensions/**",
-    "scripts/**"
+    "scripts/**",
+    "docs/**"
   ],
   "dsh": {
     "bundle": {
