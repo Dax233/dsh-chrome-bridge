@@ -538,7 +538,7 @@ test("logs supports keyword filtering and clearing", async () => {
   assert.equal(after.entries.length, 0);
 });
 
-test("screenshot fullPage clips the whole content and captures beyond the viewport", async () => {
+test("screenshot fullPage grows the emulated viewport, captures it, then restores", async () => {
   const { chromeApi, calls, state } = makeChromeMock();
   state.layoutMetrics = { cssContentSize: { width: 1200, height: 3000 }, contentSize: { width: 1200, height: 2800 } };
   const controller = createChromeController(chromeApi);
@@ -546,13 +546,52 @@ test("screenshot fullPage clips the whole content and captures beyond the viewpo
   assert.equal(result.ok, true);
   assert.equal(result.format, "png");
   assert.equal(result.capture.mode, "fullPage");
-  assert.deepEqual(result.capture.clip, { x: 0, y: 0, width: 1200, height: 3000, scale: 1 }, "the larger content size wins; scale defaults to 1");
-  assert.equal(result.capture.width, 1200);
-  assert.equal(result.capture.height, 3000);
+  assert.equal(result.capture.cssWidth, 1280, "the current viewport width is kept");
+  assert.equal(result.capture.cssHeight, 3000);
+  assert.equal(result.capture.requestedHeight, 3000);
+  assert.equal(result.capture.capped, false);
+  const resize = calls.filter((call) => call.cdp === "Emulation.setDeviceMetricsOverride").at(-1);
+  assert.deepEqual(resize.params, {
+    width: 1280,
+    height: 3000,
+    deviceScaleFactor: 0,
+    mobile: false,
+    screenWidth: 1280,
+    screenHeight: 3000,
+  });
   const shot = calls.find((call) => call.cdp === "Page.captureScreenshot");
-  assert.deepEqual(shot.params.clip, { x: 0, y: 0, width: 1200, height: 3000, scale: 1 }, "CDP requires clip.scale (mandatory)");
-  assert.equal(shot.params.captureBeyondViewport, true);
+  assert.equal(shot.params.clip, undefined, "no clip / captureBeyondViewport (real Chrome hangs on that)");
+  assert.equal(shot.params.captureBeyondViewport, undefined);
+  assert.equal(shot.params.fromSurface, true);
   assert.equal(shot.params.format, "png");
+  assert.ok(
+    calls.some((call) => call.cdp === "Emulation.clearDeviceMetricsOverride"),
+    "the previous (here: none) device metrics must be restored",
+  );
+});
+
+test("screenshot fullPage keeps an active emulation and restores it afterwards", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  state.pageMetrics = { width: 390, height: 844, devicePixelRatio: 2, colorScheme: "dark" };
+  state.layoutMetrics = { cssContentSize: { width: 375, height: 4000 } };
+  const controller = createChromeController(chromeApi);
+  await controller.emulate(1, { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+  calls.length = 0;
+  const result = await controller.captureScreenshot(1, { fullPage: true });
+  assert.equal(result.capture.cssWidth, 390, "an active emulated width is kept");
+  assert.equal(result.capture.cssHeight, 4000);
+  assert.equal(result.capture.width, 780, "predicted pixels include the emulated deviceScaleFactor");
+  assert.equal(result.capture.height, 8000);
+  const resizes = calls.filter((call) => call.cdp === "Emulation.setDeviceMetricsOverride");
+  assert.equal(resizes.length, 2, "one grow + one restore");
+  assert.deepEqual(resizes.at(-1).params, {
+    width: 390,
+    height: 844,
+    deviceScaleFactor: 2,
+    mobile: true,
+    screenWidth: 390,
+    screenHeight: 844,
+  });
 });
 
 test("screenshot jpeg quality is forwarded and quality is rejected for png", async () => {
@@ -570,7 +609,7 @@ test("screenshot jpeg quality is forwarded and quality is rejected for png", asy
   await assert.rejects(() => controller.captureScreenshot(1, { format: "gif" }), /format/);
 });
 
-test("screenshot of an AX ref resolves the node and clips its page box", async () => {
+test("screenshot of an AX ref scrolls it into view and clips its viewport box", async () => {
   const { chromeApi, calls, state } = makeChromeMock();
   state.axTree = [
     { nodeId: "1", ignored: false, role: { value: "RootWebArea" }, name: { value: "Example" }, backendDOMNodeId: 100 },
@@ -589,11 +628,15 @@ test("screenshot of an AX ref resolves the node and clips its page box", async (
   const measure = calls.find(
     (call) => call.cdp === "Runtime.callFunctionOn" && String(call.params.functionDeclaration).includes("__dshAgentElementRect"),
   );
-  assert.ok(measure, "the page must be asked for getBoundingClientRect + scroll offsets");
+  assert.ok(measure, "the page must be asked for scrollIntoView + getBoundingClientRect");
+  assert.match(String(measure.params.functionDeclaration), /scrollIntoView/);
+  assert.equal(measure.params.awaitPromise, true);
+  const shot = calls.filter((call) => call.cdp === "Page.captureScreenshot").at(-1);
+  assert.equal(shot.params.captureBeyondViewport, undefined, "real Chrome hangs on captureBeyondViewport");
   await assert.rejects(() => controller.captureScreenshot(1, { ref: "n999" }), /not in the current snapshot/);
 });
 
-test("screenshot selector and explicit clips use page coordinates", async () => {
+test("screenshot selector and explicit clips use viewport coordinates", async () => {
   const { chromeApi, calls, state } = makeChromeMock();
   state.selectorRect = { found: true, x: 15, y: 25, width: 200, height: 100 };
   const controller = createChromeController(chromeApi);
@@ -604,6 +647,7 @@ test("screenshot selector and explicit clips use page coordinates", async () => 
     (call) => call.cdp === "Runtime.evaluate" && String(call.params.expression).includes("__dshAgentSelectorRect"),
   );
   assert.match(String(selectorEval.params.expression), /querySelector\("#hero"\)/);
+  assert.match(String(selectorEval.params.expression), /scrollIntoView/);
   state.selectorRect = { found: false };
   await assert.rejects(() => controller.captureScreenshot(1, { selector: "#missing" }), /did not match/);
   const byClip = await controller.captureScreenshot(1, { clip: { x: 5, y: 6, width: 20, height: 30, scale: 2 } });
@@ -612,8 +656,11 @@ test("screenshot selector and explicit clips use page coordinates", async () => 
   assert.equal(byClip.capture.height, 60);
   const lastShot = calls.filter((call) => call.cdp === "Page.captureScreenshot").at(-1);
   assert.deepEqual(lastShot.params.clip, { x: 5, y: 6, width: 20, height: 30, scale: 2 });
+  assert.equal(lastShot.params.captureBeyondViewport, undefined);
   await assert.rejects(() => controller.captureScreenshot(1, { clip: { x: 0, y: 0, width: 0, height: 10 } }), /positive/);
   await assert.rejects(() => controller.captureScreenshot(1, { fullPage: true, selector: "#hero" }), /only one of/);
+  // A clip fully outside the viewport must not silently capture nothing.
+  await assert.rejects(() => controller.captureScreenshot(1, { clip: { x: 5000, y: 5000, width: 50, height: 50 } }), /outside the visible viewport/);
 });
 
 test("emulate applies device metrics and prefers-color-scheme and reads them back", async () => {

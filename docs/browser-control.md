@@ -613,3 +613,21 @@ token 移出 WS query。
 - 待下一轮扩展 reload 后复验：fullPage 实际像素、ref/selector/clip 元素截图、`networkIdle` 在慢页面上的
   等待时长（已用本地 slow probe 观察 requestWillBeSent 计数正确）。
 
+### 34.7 第三轮真机（2026-10-27，0.1.27 → 0.1.28）
+
+0.1.27（clip.scale 修复）reload 后，**viewport 截图正常**（390x844 @2x → 780x1688），但：
+
+- `screenshot {clip: {...}}` 与 `screenshot {fullPage:true}` 都 **20s 超时**；fullPage 尝试后
+  tab 被留在 `innerWidth=780, innerHeight=7000`（= clip 尺寸 × dsf），detach/attach 新会话也不恢复，
+  只能关掉标签页。结论：真机 Chrome 156 上 `Page.captureScreenshot` 一旦带
+  `captureBeyondViewport`（无论有没有 clip）就**不返回**，并且可能污染 tab 的 viewport 状态。
+- 0.1.28 重写截图路径，完全不用 `captureBeyondViewport`：
+  - `fullPage`：保留当前仿真宽/deviceScaleFactor，`Emulation.setDeviceMetricsOverride` 把高度改成
+    内容高度（≤12000 CSS px），等 120ms，截完整视口，再恢复原来的 device metrics（原本没有就
+    `clearDeviceMetricsOverride`）。输出像素 = 宽 × 高 × 有效 dsf；base64 超 7MB 帧预算直接报错。
+  - `clip` / `ref` / `selector`：统一改为**视口坐标**，只截可见表面；ref/selector 先
+    `scrollIntoView({behavior:'instant'})` 并等两帧；越出视口就报错而不是静默截空。
+- 测试：fullPage 的 grow/restore 时序、emulation 激活时的 dsf 预测、ref/selector 的 scrollIntoView
+  与 awaitPromise、clip 视口裁剪、`captureBeyondViewport` 不再出现；全套 **88 项全绿**。
+- 版本：package.json / manifest / Hello 帧统一 0.1.28。真机复验需再 reload 扩展一次。
+

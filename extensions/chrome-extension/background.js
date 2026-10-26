@@ -49,7 +49,7 @@ async function connect() {
     attempt = 0;
     try {
       // The token is a handshake field, not a URL query: URLs leak into logs.
-      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.27", token }));
+      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.28", token }));
     } catch {
       // The close handler will reconnect.
     }

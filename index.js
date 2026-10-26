@@ -65,7 +65,7 @@ const DESCRIPTION =
   "type {tabId,text,ref?}, key {tabId,key}, scroll {tabId,deltaY}, screenshot {tabId,format?,quality?,fullPage?,clip?,ref?,selector?}, " +
   "emulate {tabId,width?,height?,deviceScaleFactor?,mobile?,colorScheme?,reset?}, logs {tabId,limit?,filter?,clear?}, upload {tabId,ref,paths}, " +
   "evaluate {tabId,expression}, wait {tabId,selector?,text?,networkIdle?,idleMs?,ms?}, detach {tabId}. " +
-  "screenshot fullPage/clip/ref/selector use CDP page coordinates and report the real captured pixel size; format png|jpeg|webp (quality only for jpeg/webp). " +
+  "screenshot fullPage temporarily grows the emulated viewport and captures it (capped, real pixel size reported); clip is a viewport (CSS px) rectangle; ref/selector are scrolled into view first; format png|jpeg|webp (quality only for jpeg/webp). " +
   "emulate drives real CDP Emulation: device metrics and prefers-color-scheme in this tab. " +
   "This is a REAL Chrome tab, not a CI or offscreen browser: emulate temporarily changes how the user's tab renders (restored by emulate{reset:true}, detach or closeTab), " +
   "and very large full-page captures may be limited by Chrome. " +
@@ -92,7 +92,7 @@ function requireHttpUrl(raw) {
   return url.href;
 }
 
-/** Validate a screenshot clip object; page coordinates, positive size. */
+/** Validate a screenshot clip object; viewport coordinates, positive size. */
 function normalizeClip(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("chrome: screenshot clip must be an object with x, y, width and height");
@@ -476,13 +476,17 @@ function formatResult(action, value) {
       const image = value.image ?? (value.capture?.width !== undefined ? { width: value.capture.width, height: value.capture.height } : undefined);
       const pixels = image === undefined ? "size unknown" : `${image.width}x${image.height} px`;
       const mode = value.capture?.mode !== undefined && value.capture.mode !== "viewport" ? `, ${String(value.capture.mode)}` : "";
-      // The controller predicts clip*scale; the image header is the truth.
+      const fullPage =
+        value.capture?.mode === "fullPage" && Number.isFinite(Number(value.capture?.cssHeight))
+          ? ` [fullPage ${Number(value.capture.cssWidth)}x${Number(value.capture.cssHeight)} CSS px${value.capture.capped === true ? ", capped at 12000" : ""}]`
+          : "";
+      // The controller predicts pixels; the image header is the truth.
       const reported = value.capture?.width !== undefined && value.capture?.height !== undefined ? value.capture : undefined;
       const mismatch =
         reported !== undefined && image !== undefined && (reported.width !== image.width || reported.height !== image.height)
           ? ` [controller expected ${reported.width}x${reported.height}]`
           : "";
-      return `screenshot saved: ${String(value.file ?? "")} (${format}, ${pixels}, ${Number(value.bytes ?? 0)} bytes${mode}${mismatch}) — call read_image with this path to view it.`;
+      return `screenshot saved: ${String(value.file ?? "")} (${format}, ${pixels}, ${Number(value.bytes ?? 0)} bytes${mode}${mismatch}${fullPage}) — call read_image with this path to view it.`;
     }
     case "emulate": {
       const viewport = value.viewport ?? {};
@@ -608,11 +612,11 @@ export function apply(ctx) {
               description: "action=wait: also require that the tab has no in-flight network requests for idleMs (ANDed with selector/text).",
             },
             idleMs: { type: "number", description: "action=wait: quiet window in milliseconds for networkIdle (default 500)." },
-            fullPage: { type: "boolean", description: "action=screenshot: capture the whole page content, not just the viewport." },
+            fullPage: { type: "boolean", description: "action=screenshot: capture the whole page by temporarily growing the emulated viewport (capped at 12000 CSS px)." },
             clip: {
               type: "object",
               description:
-                "action=screenshot: capture one region in CSS page (document) coordinates: {x, y, width, height, scale?}. Cannot be combined with fullPage/ref/selector.",
+                "action=screenshot: capture one region in viewport (CSS px) coordinates: {x, y, width, height, scale?}. Cannot be combined with fullPage/ref/selector.",
               properties: {
                 x: { type: "number" },
                 y: { type: "number" },

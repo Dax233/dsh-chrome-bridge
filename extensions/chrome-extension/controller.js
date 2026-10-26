@@ -150,21 +150,34 @@ const VIEWPORT_METRICS_JS = `(async () => { // __dshAgentViewportMetrics
   };
 })()`;
 
-/** Page (document) coordinates of a selector match, for Page.captureScreenshot clip. */
-const SELECTOR_RECT_JS = (selector) => `(() => { // __dshAgentSelectorRect
+/**
+ * Viewport coordinates of a selector match, for Page.captureScreenshot clip.
+ * The element is scrolled into view first (with an instant scroll) and the
+ * result is a getBoundingClientRect-style viewport rect.
+ */
+const SELECTOR_RECT_JS = (selector) => `(async () => { // __dshAgentSelectorRect
   const el = document.querySelector(${JSON.stringify(String(selector ?? ""))});
   if (!el) return { found: false };
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  await Promise.race([nextFrame(), new Promise((resolve) => setTimeout(resolve, 200))]);
   const rect = el.getBoundingClientRect();
-  return { found: true, x: rect.left + window.scrollX, y: rect.top + window.scrollY, width: rect.width, height: rect.height };
+  return { found: true, x: rect.left, y: rect.top, width: rect.width, height: rect.height };
 })()`;
 
-/** Page (document) coordinates of the resolved AX node, for Page.captureScreenshot clip. */
-const ELEMENT_RECT_FN = `function () { // __dshAgentElementRect
+/** Viewport coordinates of the resolved AX node, for Page.captureScreenshot clip. */
+const ELEMENT_RECT_FN = `async function () { // __dshAgentElementRect
+  this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  await Promise.race([nextFrame(), new Promise((resolve) => setTimeout(resolve, 200))]);
   const rect = this.getBoundingClientRect();
-  return { x: rect.left + window.scrollX, y: rect.top + window.scrollY, width: rect.width, height: rect.height };
+  return { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
 }`;
 
 const SCREENSHOT_FORMATS = new Set(["png", "jpeg", "webp"]);
+/** Full-page capture cap (CSS px) and the websocket frame budget for base64 data. */
+const FULL_PAGE_MAX_CSS_PX = 12000;
+const MAX_CAPTURE_BASE64 = 7 * 1024 * 1024;
 
 /**
  * Every override a QA emulation can apply. Chrome drops CDP overrides when the
@@ -1295,7 +1308,7 @@ export function createChromeController(chromeApi, options = {}) {
     return clip;
   }
 
-  /** Normalise a DOMRect-like value into a positive page-coordinate clip. */
+  /** Normalise a DOMRect-like value into a positive viewport clip. */
   function clipFromRect(value) {
     const x = Number(value?.x);
     const y = Number(value?.y);
@@ -1308,7 +1321,18 @@ export function createChromeController(chromeApi, options = {}) {
     return { x: Math.max(0, x), y: Math.max(0, y), width, height };
   }
 
-  /** Page coordinates of an AX ref: resolve the node, then ask the page for its box. */
+  /** Intersect a clip with the real viewport (CDP only captures the surface here). */
+  function clipToViewport(clip, viewport) {
+    const left = Math.max(0, Math.round(Number(clip?.x ?? 0)));
+    const top = Math.max(0, Math.round(Number(clip?.y ?? 0)));
+    const right = Math.min(Math.max(1, Math.round(Number(viewport?.width ?? 0))), Math.round(Number(clip?.x ?? 0) + Number(clip?.width ?? 0)));
+    const bottom = Math.min(Math.max(1, Math.round(Number(viewport?.height ?? 0))), Math.round(Number(clip?.y ?? 0) + Number(clip?.height ?? 0)));
+    if (right - left < 1 || bottom - top < 1) return undefined;
+    const scale = Number(clip?.scale);
+    return { x: left, y: top, width: right - left, height: bottom - top, ...(Number.isFinite(scale) && scale > 0 ? { scale } : {}) };
+  }
+
+  /** Viewport coordinates of an AX ref: resolve the node, scroll it in, measure. */
   async function refScreenshotClip(tabId, ref, refInfo) {
     let objectId;
     try {
@@ -1323,7 +1347,12 @@ export function createChromeController(chromeApi, options = {}) {
       if (typeof resolved?.objectId !== "string") throw new Error(`element ref ${ref} could not be resolved; take a new snapshot`);
       objectId = resolved.objectId;
     }
-    const response = await send(tabId, "Runtime.callFunctionOn", { objectId, functionDeclaration: ELEMENT_RECT_FN, returnByValue: true });
+    const response = await send(tabId, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: ELEMENT_RECT_FN,
+      returnByValue: true,
+      awaitPromise: true,
+    });
     if (response?.exceptionDetails) throw new Error(`element ref ${ref} could not be measured; take a new snapshot`);
     const clip = clipFromRect(response?.result?.value);
     // Child-frame refs are measured in their own document; snapshot recorded the
@@ -1340,21 +1369,17 @@ export function createChromeController(chromeApi, options = {}) {
     return clipFromRect(value);
   }
 
-  /**
-   * Full-page clip from Page.getLayoutMetrics. cssContentSize ignores the
-   * scrollbar-clipped contentSize; when both exist take the larger so the
-   * capture never crops a scrollbar-sized sliver.
-   */
-  async function fullPageScreenshotClip(tabId) {
+  /** Content size from Page.getLayoutMetrics (cssContentSize wins when larger). */
+  async function contentSize(tabId) {
     const metrics = await send(tabId, "Page.getLayoutMetrics");
     const sizes = [metrics?.cssContentSize, metrics?.contentSize].filter((size) => size !== undefined && size !== null);
-    if (sizes.length === 0) throw new Error("the page did not report a content size for fullPage");
+    if (sizes.length === 0) throw new Error("the page did not report a content size");
     const width = Math.max(...sizes.map((size) => Number(size.width ?? 0)));
     const height = Math.max(...sizes.map((size) => Number(size.height ?? 0)));
     if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
-      throw new Error("the page reported an empty content size for fullPage");
+      throw new Error("the page reported an empty content size");
     }
-    return { x: 0, y: 0, width: Math.ceil(width), height: Math.ceil(height) };
+    return { width: Math.ceil(width), height: Math.ceil(height) };
   }
 
   async function pageViewport(tabId) {
@@ -1384,10 +1409,92 @@ export function createChromeController(chromeApi, options = {}) {
     return errors;
   }
 
+  /** The deviceScaleFactor in effect for this tab (0 means "native"). */
+  function effectiveDeviceScaleFactor(tabId, nativeDpr) {
+    const emulation = emulationByTab.get(tabId);
+    const dsf = Number(emulation?.deviceScaleFactor ?? 0);
+    if (Number.isFinite(dsf) && dsf > 0) return dsf;
+    const dpr = Number(nativeDpr ?? 0);
+    return Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  }
+
+  /** Restore the device-metrics override that was active before a fullPage capture. */
+  async function restoreDeviceMetrics(tabId, previous) {
+    if (previous !== undefined && Number.isFinite(Number(previous.width)) && Number.isFinite(Number(previous.height))) {
+      await send(tabId, "Emulation.setDeviceMetricsOverride", {
+        width: Number(previous.width),
+        height: Number(previous.height),
+        deviceScaleFactor: Number(previous.deviceScaleFactor ?? 0) > 0 ? Number(previous.deviceScaleFactor) : 0,
+        mobile: previous.mobile === true,
+        screenWidth: Number(previous.width),
+        screenHeight: Number(previous.height),
+      });
+      return;
+    }
+    await send(tabId, "Emulation.clearDeviceMetricsOverride");
+  }
+
   /**
-   * Parameterised Page.captureScreenshot. A user clip is in page (document)
-   * coordinates; fullPage/ref/selector clips are derived in the same space and
-   * captured with captureBeyondViewport so content below the fold is included.
+   * Full-page capture without `captureBeyondViewport`.
+   *
+   * Real Chrome 156 hangs on `Page.captureScreenshot` when captureBeyondViewport
+   * (with or without a clip) is sent through chrome.debugger on a background tab
+   * — the promise never settles and the tab can be left at the capture surface
+   * size. Instead: keep the current width/deviceScaleFactor, temporarily grow the
+   * emulated viewport to the content height, capture the now-complete viewport,
+   * then restore the previous device-metrics override.
+   */
+  async function captureFullPage(tabId, options = {}) {
+    const format = screenshotFormatOf(options.format);
+    const quality = screenshotQualityOf(options.quality, format);
+    const size = await contentSize(tabId);
+    const measured = await pageViewport(tabId);
+    const previous = emulationByTab.get(tabId);
+    const width = Math.max(1, Math.round(Number(previous?.width ?? measured.viewport.width ?? size.width)));
+    const capturedHeight = Math.max(1, Math.min(size.height, FULL_PAGE_MAX_CSS_PX));
+    const dsf = Math.max(0, Number(previous?.deviceScaleFactor ?? 0));
+    try {
+      await send(tabId, "Emulation.setDeviceMetricsOverride", {
+        width,
+        height: capturedHeight,
+        deviceScaleFactor: dsf,
+        mobile: previous?.mobile === true,
+        screenWidth: width,
+        screenHeight: capturedHeight,
+      });
+      // Give the renderer a frame to relayout before capturing.
+      await delay(120);
+      const params = { format, fromSurface: true };
+      if (quality !== undefined) params.quality = quality;
+      const response = await send(tabId, "Page.captureScreenshot", params);
+      if (typeof response?.data !== "string" || response.data === "") throw new Error("fullPage screenshot failed");
+      const effectiveDsf = effectiveDeviceScaleFactor(tabId, measured.viewport.devicePixelRatio);
+      return {
+        data: response.data,
+        format,
+        ...(quality === undefined ? {} : { quality }),
+        capture: {
+          mode: "fullPage",
+          width: Math.max(1, Math.round(width * effectiveDsf)),
+          height: Math.max(1, Math.round(capturedHeight * effectiveDsf)),
+          cssWidth: width,
+          cssHeight: capturedHeight,
+          capped: size.height > FULL_PAGE_MAX_CSS_PX,
+          requestedHeight: size.height,
+        },
+      };
+    } finally {
+      await restoreDeviceMetrics(tabId, previous).catch(() => {});
+    }
+  }
+
+  /**
+   * Parameterised Page.captureScreenshot.
+   *
+   * clip is in **viewport (CSS px) coordinates** and is intersected with the real
+   * viewport: element/ref/selector targets are scrolled into view first, and
+   * explicit clips are viewport rectangles. `captureBeyondViewport` is never
+   * used (see captureFullPage); fullPage grows the emulated viewport instead.
    */
   async function captureScreenshot(tabId, input = {}) {
     const id = tabIdOf(tabId);
@@ -1407,12 +1514,16 @@ export function createChromeController(chromeApi, options = {}) {
       explicitClip === undefined ? undefined : "clip",
     ].filter((mode) => mode !== undefined);
     if (modes.length > 1) throw new Error(`screenshot accepts only one of fullPage, clip, ref or selector (got ${modes.join(", ")})`);
+    if (wantsFullPage) {
+      const shot = await captureFullPage(id, { format, quality });
+      if (shot.data.length > MAX_CAPTURE_BASE64) {
+        throw new Error(`fullPage screenshot is too large for the bridge (${shot.data.length} base64 chars; limit ${MAX_CAPTURE_BASE64}) — lower deviceScaleFactor or capture a clip instead`);
+      }
+      return { ok: true, tabId: id, ...shot };
+    }
     let clip = explicitClip;
     let mode = explicitClip === undefined ? "viewport" : "clip";
-    if (wantsFullPage) {
-      clip = await fullPageScreenshotClip(id);
-      mode = "fullPage";
-    } else if (wantsRef) {
+    if (wantsRef) {
       const ref = String(options.ref);
       const refInfo = refsByTab.get(id)?.get(ref);
       if (refInfo === undefined) throw new Error(`element ref ${ref} is not in the current snapshot; take a new snapshot`);
@@ -1422,24 +1533,27 @@ export function createChromeController(chromeApi, options = {}) {
       clip = await selectorScreenshotClip(id, options.selector.trim());
       mode = "selector";
     }
+    const measured = await pageViewport(id);
     if (clip !== undefined) {
-      // Chromium's Page.captureScreenshot treats clip.scale as mandatory (a
-      // missing scale fails the whole call with "Failed to deserialize
-      // params.clip.scale - BINDINGS: mandatory field missing", observed on a
-      // real tab). Normalise it here for user clips and derived fullPage/ref/
-      // selector clips alike.
-      const scale = Number(clip.scale);
-      clip = { ...clip, scale: Number.isFinite(scale) && scale > 0 ? scale : 1 };
+      const clamped = clipToViewport(clip, measured.viewport);
+      if (clamped === undefined) throw new Error("screenshot region is outside the visible viewport; scroll it into view or use fullPage");
+      clip = clamped;
     }
-    const params = { format };
+    const params = { format, fromSurface: true };
     if (quality !== undefined) params.quality = quality;
     if (clip !== undefined) {
-      params.clip = clip;
-      params.captureBeyondViewport = true;
+      // clip.scale is mandatory in current CDP; keep the caller's scale (or 1).
+      params.clip = { ...clip, scale: Number(clip.scale) > 0 ? Number(clip.scale) : 1 };
     }
     const response = await send(id, "Page.captureScreenshot", params);
     if (typeof response?.data !== "string" || response.data === "") throw new Error("screenshot failed");
-    const scale = clip?.scale ?? 1;
+    if (response.data.length > MAX_CAPTURE_BASE64) {
+      throw new Error(`screenshot is too large for the bridge (${response.data.length} base64 chars; limit ${MAX_CAPTURE_BASE64}) — lower deviceScaleFactor or capture a smaller clip`);
+    }
+    const effectiveDsf = effectiveDeviceScaleFactor(id, measured.viewport.devicePixelRatio);
+    const cssWidth = clip === undefined ? measured.viewport.width : clip.width;
+    const cssHeight = clip === undefined ? measured.viewport.height : clip.height;
+    const clipScale = clip === undefined ? 1 : Number(clip.scale) > 0 ? Number(clip.scale) : 1;
     return {
       ok: true,
       tabId: id,
@@ -1448,7 +1562,9 @@ export function createChromeController(chromeApi, options = {}) {
       ...(quality === undefined ? {} : { quality }),
       capture: {
         mode,
-        ...(clip === undefined ? {} : { clip, width: Math.max(1, Math.round(clip.width * scale)), height: Math.max(1, Math.round(clip.height * scale)) }),
+        ...(clip === undefined ? {} : { clip: params.clip }),
+        width: Math.max(1, Math.round(cssWidth * clipScale * effectiveDsf)),
+        height: Math.max(1, Math.round(cssHeight * clipScale * effectiveDsf)),
       },
     };
   }
