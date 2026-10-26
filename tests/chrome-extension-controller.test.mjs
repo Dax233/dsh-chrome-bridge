@@ -6,6 +6,8 @@ function makeChromeMock() {
   const calls = [];
   const state = {
     debuggerListeners: [],
+    detachListeners: [],
+    tabRemovedListeners: [],
     evaluateResults: {
       snapshot: {
         title: "Example Domain",
@@ -21,6 +23,11 @@ function makeChromeMock() {
   };
   const chromeApi = {
     tabs: {
+      onRemoved: {
+        addListener(listener) {
+          state.tabRemovedListeners.push(listener);
+        },
+      },
       async query() {
         calls.push({ method: "tabs.query" });
         return [
@@ -60,6 +67,11 @@ function makeChromeMock() {
           state.debuggerListeners.push(listener);
         },
       },
+      onDetach: {
+        addListener(listener) {
+          state.detachListeners.push(listener);
+        },
+      },
       async attach(target, version) {
         calls.push({ method: "debugger.attach", target, version });
       },
@@ -77,7 +89,13 @@ function makeChromeMock() {
           if (expression.includes("__dshAgentScrollState")) return { result: { value: state.evaluateResults.scrollState } };
           if (expression.includes("__dshAgentFocusedValue")) return { result: { value: state.evaluateResults.focusedValue } };
           if (expression.includes("__dshAgentEditable")) return { result: { value: state.editable ?? { editable: true, tag: "input", value: "hello" } } };
-          if (expression.includes("__dshAgentWait")) return { result: { value: { found: true } } };
+          if (expression.includes("__dshAgentWait")) return { result: { value: { found: true, selectorFound: true, textFound: true } } };
+          if (expression.includes("__dshAgentViewportMetrics")) {
+            return { result: { value: state.pageMetrics ?? { width: 1280, height: 800, devicePixelRatio: 1, colorScheme: "light" } } };
+          }
+          if (expression.includes("__dshAgentSelectorRect")) {
+            return { result: { value: state.selectorRect ?? { found: true, x: 15, y: 25, width: 200, height: 100 } } };
+          }
           if (expression.includes("__dshAgentFrameClick")) return { result: { value: { clicked: true, tag: "A" } } };
           if (expression.includes("__dshAgentScrollFallback")) return { result: { value: { scrolled: true } } };
           return { result: { value: { title: "Example Domain", url: "https://example.com/" } } };
@@ -95,7 +113,14 @@ function makeChromeMock() {
         if (method === "Page.getFrameTree") return state.frameTree === undefined ? {} : { frameTree: state.frameTree };
         if (method === "DOM.getFrameOwner") return { backendNodeId: state.frameOwners?.[params?.frameId] };
         if (method === "DOM.describeNode") return { node: { frameId: state.describeFrameIds?.[params?.nodeId] } };
-        if (method === "Runtime.callFunctionOn") return { result: { value: true } };
+        if (method === "Runtime.callFunctionOn") {
+          const declaration = String(params?.functionDeclaration ?? "");
+          if (declaration.includes("__dshAgentElementRect")) return { result: { value: state.elementRect ?? { x: 100, y: 250, width: 80, height: 40 } } };
+          return { result: { value: true } };
+        }
+        if (method === "Page.getLayoutMetrics") {
+          return state.layoutMetrics ?? { cssContentSize: { width: 1200, height: 3000 }, contentSize: { width: 1200, height: 2800 } };
+        }
         if (method === "DOM.getBoxModel") {
           return { model: { content: state.boxModels?.[params?.nodeId] ?? [0, 0, 10, 0, 10, 10, 0, 10] } };
         }
@@ -511,4 +536,244 @@ test("logs supports keyword filtering and clearing", async () => {
   assert.equal(cleared.total, 0);
   const after = await controller.logs(1);
   assert.equal(after.entries.length, 0);
+});
+
+test("screenshot fullPage clips the whole content and captures beyond the viewport", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  state.layoutMetrics = { cssContentSize: { width: 1200, height: 3000 }, contentSize: { width: 1200, height: 2800 } };
+  const controller = createChromeController(chromeApi);
+  const result = await controller.captureScreenshot(1, { fullPage: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.format, "png");
+  assert.equal(result.capture.mode, "fullPage");
+  assert.deepEqual(result.capture.clip, { x: 0, y: 0, width: 1200, height: 3000 }, "the larger content size wins");
+  assert.equal(result.capture.width, 1200);
+  assert.equal(result.capture.height, 3000);
+  const shot = calls.find((call) => call.cdp === "Page.captureScreenshot");
+  assert.deepEqual(shot.params.clip, { x: 0, y: 0, width: 1200, height: 3000 });
+  assert.equal(shot.params.captureBeyondViewport, true);
+  assert.equal(shot.params.format, "png");
+});
+
+test("screenshot jpeg quality is forwarded and quality is rejected for png", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  const result = await controller.captureScreenshot(1, { format: "jpeg", quality: 72.6 });
+  assert.equal(result.format, "jpeg");
+  assert.equal(result.quality, 73);
+  const shot = calls.find((call) => call.cdp === "Page.captureScreenshot");
+  assert.equal(shot.params.format, "jpeg");
+  assert.equal(shot.params.quality, 73);
+  const alias = await controller.captureScreenshot(1, { format: "jpg" });
+  assert.equal(alias.format, "jpeg");
+  await assert.rejects(() => controller.captureScreenshot(1, { format: "png", quality: 50 }), /quality/);
+  await assert.rejects(() => controller.captureScreenshot(1, { format: "gif" }), /format/);
+});
+
+test("screenshot of an AX ref resolves the node and clips its page box", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  state.axTree = [
+    { nodeId: "1", ignored: false, role: { value: "RootWebArea" }, name: { value: "Example" }, backendDOMNodeId: 100 },
+    { nodeId: "2", parentId: "1", ignored: false, role: { value: "link" }, name: { value: "Learn more" }, backendDOMNodeId: 123 },
+  ];
+  state.elementRect = { x: 100, y: 250, width: 80, height: 40 };
+  const controller = createChromeController(chromeApi);
+  await controller.snapshot(1);
+  const result = await controller.captureScreenshot(1, { ref: "n123" });
+  assert.equal(result.capture.mode, "ref");
+  assert.deepEqual(result.capture.clip, { x: 100, y: 250, width: 80, height: 40 });
+  assert.equal(result.capture.width, 80);
+  assert.equal(result.capture.height, 40);
+  const resolve = calls.find((call) => call.cdp === "DOM.resolveNode" && call.params.backendNodeId === 123);
+  assert.ok(resolve, "the ref must resolve through its backendNodeId");
+  const measure = calls.find(
+    (call) => call.cdp === "Runtime.callFunctionOn" && String(call.params.functionDeclaration).includes("__dshAgentElementRect"),
+  );
+  assert.ok(measure, "the page must be asked for getBoundingClientRect + scroll offsets");
+  await assert.rejects(() => controller.captureScreenshot(1, { ref: "n999" }), /not in the current snapshot/);
+});
+
+test("screenshot selector and explicit clips use page coordinates", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  state.selectorRect = { found: true, x: 15, y: 25, width: 200, height: 100 };
+  const controller = createChromeController(chromeApi);
+  const bySelector = await controller.captureScreenshot(1, { selector: "#hero" });
+  assert.equal(bySelector.capture.mode, "selector");
+  assert.deepEqual(bySelector.capture.clip, { x: 15, y: 25, width: 200, height: 100 });
+  const selectorEval = calls.find(
+    (call) => call.cdp === "Runtime.evaluate" && String(call.params.expression).includes("__dshAgentSelectorRect"),
+  );
+  assert.match(String(selectorEval.params.expression), /querySelector\("#hero"\)/);
+  state.selectorRect = { found: false };
+  await assert.rejects(() => controller.captureScreenshot(1, { selector: "#missing" }), /did not match/);
+  const byClip = await controller.captureScreenshot(1, { clip: { x: 5, y: 6, width: 20, height: 30, scale: 2 } });
+  assert.equal(byClip.capture.mode, "clip");
+  assert.equal(byClip.capture.width, 40, "scale multiplies the reported pixel width");
+  assert.equal(byClip.capture.height, 60);
+  const lastShot = calls.filter((call) => call.cdp === "Page.captureScreenshot").at(-1);
+  assert.deepEqual(lastShot.params.clip, { x: 5, y: 6, width: 20, height: 30, scale: 2 });
+  await assert.rejects(() => controller.captureScreenshot(1, { clip: { x: 0, y: 0, width: 0, height: 10 } }), /positive/);
+  await assert.rejects(() => controller.captureScreenshot(1, { fullPage: true, selector: "#hero" }), /only one of/);
+});
+
+test("emulate applies device metrics and prefers-color-scheme and reads them back", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  state.pageMetrics = { width: 390, height: 844, devicePixelRatio: 2, colorScheme: "dark" };
+  const controller = createChromeController(chromeApi);
+  const result = await controller.emulate(1, { width: 390, height: 844, deviceScaleFactor: 2, mobile: true, colorScheme: "dark" });
+  assert.equal(result.ok, true);
+  assert.equal(result.reset, false);
+  assert.deepEqual(result.emulated, { width: 390, height: 844, deviceScaleFactor: 2, mobile: true, colorScheme: "dark" });
+  assert.deepEqual(result.applied, { deviceMetrics: true, media: true });
+  assert.deepEqual(result.viewport, { width: 390, height: 844, devicePixelRatio: 2 });
+  assert.equal(result.colorScheme, "dark");
+  const metrics = calls.find((call) => call.cdp === "Emulation.setDeviceMetricsOverride");
+  assert.deepEqual(metrics.params, { width: 390, height: 844, deviceScaleFactor: 2, mobile: true, screenWidth: 390, screenHeight: 844 });
+  const media = calls.find((call) => call.cdp === "Emulation.setEmulatedMedia");
+  assert.deepEqual(media.params, { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+  const readback = calls.find(
+    (call) => call.cdp === "Runtime.evaluate" && String(call.params.expression).includes("__dshAgentViewportMetrics"),
+  );
+  assert.ok(readback, "emulate must read the applied viewport back from the page");
+});
+
+test("emulate colorScheme alone leaves device metrics untouched", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  const result = await controller.emulate(1, { colorScheme: "light" });
+  assert.equal(result.applied.deviceMetrics, false);
+  assert.equal(result.applied.media, true);
+  assert.equal(calls.some((call) => call.cdp === "Emulation.setDeviceMetricsOverride"), false);
+  assert.equal(calls.some((call) => call.cdp === "Emulation.setEmulatedMedia"), true);
+});
+
+test("emulate reset clears every override and reports the real viewport", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.emulate(1, { width: 390, height: 844, colorScheme: "dark" });
+  state.pageMetrics = { width: 1280, height: 800, devicePixelRatio: 1, colorScheme: "light" };
+  const reset = await controller.emulate(1, { reset: true });
+  assert.equal(reset.reset, true);
+  assert.deepEqual(reset.viewport, { width: 1280, height: 800, devicePixelRatio: 1 });
+  assert.equal(reset.colorScheme, "light");
+  assert.ok(calls.some((call) => call.cdp === "Emulation.clearDeviceMetricsOverride"));
+  const media = calls.filter((call) => call.cdp === "Emulation.setEmulatedMedia").at(-1);
+  assert.deepEqual(media.params, { features: [] });
+  const touch = calls.find((call) => call.cdp === "Emulation.setTouchEmulationEnabled");
+  assert.deepEqual(touch.params, { enabled: false });
+});
+
+test("emulate rejects invalid parameters before touching CDP emulation", async () => {
+  const { chromeApi } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await assert.rejects(() => controller.emulate(1, { width: 390 }), /both width and height/);
+  await assert.rejects(() => controller.emulate(1, { deviceScaleFactor: 2 }), /requires width and height/);
+  await assert.rejects(() => controller.emulate(1, { width: 0, height: 800 }), /positive/);
+  await assert.rejects(() => controller.emulate(1, { colorScheme: "sepia" }), /light.*dark/);
+  await assert.rejects(() => controller.emulate(1, {}), /requires width\/height/);
+  await assert.rejects(() => controller.emulate(1, { width: 100, height: 100, mobile: "yes" }), /boolean/);
+});
+
+test("detach restores emulation before dropping the debugger session", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  await controller.emulate(1, { width: 390, height: 844, colorScheme: "dark" });
+  assert.equal(calls.filter((call) => call.cdp === "Emulation.clearDeviceMetricsOverride").length, 0);
+  const result = await controller.detach(1);
+  assert.equal(result.ok, true);
+  assert.equal(result.emulationReset, true);
+  const clearIndex = calls.findIndex((call) => call.cdp === "Emulation.clearDeviceMetricsOverride");
+  const detachIndex = calls.findIndex((call) => call.method === "debugger.detach");
+  assert.ok(clearIndex >= 0 && detachIndex > clearIndex, "the override must be cleared before chrome.debugger.detach");
+});
+
+test("closeTab restores emulation before removing the tab", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  await controller.emulate(1, { width: 390, height: 844 });
+  const result = await controller.closeTab(1);
+  assert.equal(result.ok, true);
+  assert.equal(result.emulationReset, true);
+  const clearIndex = calls.findIndex((call) => call.cdp === "Emulation.clearDeviceMetricsOverride");
+  const removeIndex = calls.findIndex((call) => call.method === "tabs.remove");
+  assert.ok(clearIndex >= 0 && removeIndex > clearIndex);
+});
+
+test("Chrome-side tab removal drops the per-tab emulation record", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  await controller.emulate(1, { width: 390, height: 844 });
+  const before = calls.length;
+  assert.equal(state.tabRemovedListeners.length, 1, "the controller must watch chrome.tabs.onRemoved");
+  state.tabRemovedListeners[0](1);
+  await controller.detach(1);
+  const after = calls.slice(before);
+  assert.equal(
+    after.some((call) => call.cdp === "Emulation.clearDeviceMetricsOverride"),
+    false,
+    "a tab Chrome already removed needs no restore calls",
+  );
+  assert.ok(after.some((call) => call.method === "debugger.detach"));
+});
+
+test("wait networkIdle waits for in-flight requests to drain", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  const listener = state.debuggerListeners[0];
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "r1", request: { url: "https://example.com/app.js" } });
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "r2", request: { url: "https://example.com/a.css" } });
+  const pending = controller.waitFor(1, { networkIdle: true, idleMs: 80, ms: 3000 });
+  setTimeout(() => {
+    listener({ tabId: 1 }, "Network.loadingFinished", { requestId: "r1" });
+    listener({ tabId: 1 }, "Network.loadingFailed", { requestId: "r2", errorText: "net::ERR_FAILED" });
+  }, 120);
+  const result = await pending;
+  assert.equal(result.ok, true);
+  assert.equal(result.networkIdle.pendingRequests, 0);
+  assert.equal(result.networkIdle.idleMs, 80);
+  assert.ok(result.waitedMs >= 120, `expected to wait for the requests, got ${result.waitedMs}ms`);
+});
+
+test("wait ANDs the page condition with networkIdle", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  const listener = state.debuggerListeners[0];
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "r9" });
+  setTimeout(() => listener({ tabId: 1 }, "Network.loadingFinished", { requestId: "r9" }), 100);
+  const result = await controller.waitFor(1, { selector: "#ready", networkIdle: true, idleMs: 40, ms: 3000 });
+  assert.equal(result.selector, "#ready");
+  assert.equal(result.selectorFound, true);
+  assert.ok(result.networkIdle !== undefined);
+  assert.ok(result.waitedMs >= 100, `the selector alone was not enough; got ${result.waitedMs}ms`);
+});
+
+test("wait networkIdle reports pending requests when it times out", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  state.debuggerListeners[0]({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "never-finishes" });
+  await assert.rejects(() => controller.waitFor(1, { networkIdle: true, idleMs: 10, ms: 120 }), /timed out.*network pending 1/);
+});
+
+test("execute dispatches screenshot QA parameters, emulate and networkIdle waits", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  state.pageMetrics = { width: 320, height: 640, devicePixelRatio: 1, colorScheme: "light" };
+  const controller = createChromeController(chromeApi);
+  const shot = await controller.execute({ type: "screenshot", tabId: 1, format: "jpeg", quality: 60 });
+  assert.equal(shot.ok, true);
+  assert.equal(shot.format, "jpeg");
+  const shotCall = calls.filter((call) => call.cdp === "Page.captureScreenshot").at(-1);
+  assert.equal(shotCall.params.format, "jpeg");
+  assert.equal(shotCall.params.quality, 60);
+  const emulated = await controller.execute({ type: "emulate", tabId: 1, width: 320, height: 640 });
+  assert.equal(emulated.ok, true);
+  assert.deepEqual(emulated.emulated, { width: 320, height: 640, deviceScaleFactor: 0, mobile: false });
+  const waited = await controller.execute({ type: "wait", tabId: 1, networkIdle: true, idleMs: 0, ms: 1000 });
+  assert.equal(waited.ok, true);
+  assert.equal(waited.networkIdle.pendingRequests, 0);
 });

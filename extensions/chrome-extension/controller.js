@@ -133,6 +133,50 @@ const FOCUSED_VALUE_JS = `(() => {
 
 const PAGE_INFO_JS = `(() => ({ title: document.title, url: location.href }))()`;
 
+/**
+ * Page-side viewport readback after an emulation change. One frame lets layout
+ * settle, but rAF is throttled/paused in hidden tabs (the bridge drives
+ * background tabs too), so a short timer races the frame instead of hanging.
+ */
+const VIEWPORT_METRICS_JS = `(async () => { // __dshAgentViewportMetrics
+  const frame = new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const fallback = new Promise((resolve) => setTimeout(resolve, 250));
+  await Promise.race([frame, fallback]);
+  return {
+    width: innerWidth,
+    height: innerHeight,
+    devicePixelRatio: devicePixelRatio,
+    colorScheme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  };
+})()`;
+
+/** Page (document) coordinates of a selector match, for Page.captureScreenshot clip. */
+const SELECTOR_RECT_JS = (selector) => `(() => { // __dshAgentSelectorRect
+  const el = document.querySelector(${JSON.stringify(String(selector ?? ""))});
+  if (!el) return { found: false };
+  const rect = el.getBoundingClientRect();
+  return { found: true, x: rect.left + window.scrollX, y: rect.top + window.scrollY, width: rect.width, height: rect.height };
+})()`;
+
+/** Page (document) coordinates of the resolved AX node, for Page.captureScreenshot clip. */
+const ELEMENT_RECT_FN = `function () { // __dshAgentElementRect
+  const rect = this.getBoundingClientRect();
+  return { x: rect.left + window.scrollX, y: rect.top + window.scrollY, width: rect.width, height: rect.height };
+}`;
+
+const SCREENSHOT_FORMATS = new Set(["png", "jpeg", "webp"]);
+
+/**
+ * Every override a QA emulation can apply. Chrome drops CDP overrides when the
+ * debugger session ends, but an explicit detach/close/reset should restore the
+ * real tab immediately rather than waiting for that.
+ */
+const EMULATION_RESET_CALLS = [
+  ["Emulation.clearDeviceMetricsOverride", {}],
+  ["Emulation.setEmulatedMedia", { features: [] }],
+  ["Emulation.setTouchEmulationEnabled", { enabled: false }],
+];
+
 const KEY_CODES = {
   Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 },
   Tab: { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 },
@@ -211,10 +255,14 @@ const EDITABLE_JS = "(() => { // __dshAgentEditable const el = document.activeEl
 const WAIT_JS = (selector, text) => {
   // Values must be interpolated into the page expression; referencing host
   // variables inside Runtime.evaluate would throw a page-side ReferenceError.
-  const body = selector !== undefined
-    ? `const el = document.querySelector(${JSON.stringify(selector)}); return { found: el !== null };`
-    : `return { found: (document.body ? document.body.innerText : "").includes(${JSON.stringify(text)}) };`;
-  return `(() => { // __dshAgentWait\n${body}\n})()`;
+  // Both conditions are ANDed: wait{selector, networkIdle} must satisfy each.
+  const selectorCheck = selector !== undefined
+    ? `const selectorFound = document.querySelector(${JSON.stringify(selector)}) !== null;`
+    : "const selectorFound = true;";
+  const textCheck = text !== undefined
+    ? `const textFound = (document.body ? document.body.innerText : "").includes(${JSON.stringify(text)});`
+    : "const textFound = true;";
+  return `(() => { // __dshAgentWait\n${selectorCheck}\n${textCheck}\nreturn { found: selectorFound && textFound, selectorFound, textFound };\n})()`;
 };
 const SUBMIT_FORM_JS = `(() => {
   const el = document.activeElement;
@@ -265,6 +313,54 @@ export function createChromeController(chromeApi) {
     return buffer;
   }
 
+  /** tabId -> { pending: Set<requestId>, lastActivity: epoch ms } for networkIdle waits. */
+  const networkByTab = new Map();
+  /** tabId -> accumulated CDP emulation overrides, so detach/close can restore the tab. */
+  const emulationByTab = new Map();
+
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Drop every per-tab record; used by detach, closeTab and Chrome-side tab removal. */
+  function releaseTabState(tabId) {
+    attached.delete(tabId);
+    refsByTab.delete(tabId);
+    logBuffers.delete(tabId);
+    networkByTab.delete(tabId);
+    emulationByTab.delete(tabId);
+  }
+
+  function networkStateFor(tabId) {
+    let state = networkByTab.get(tabId);
+    if (state === undefined) {
+      state = { pending: new Set(), lastActivity: Date.now() };
+      networkByTab.set(tabId, state);
+    }
+    return state;
+  }
+
+  function markNetworkStarted(tabId, requestId) {
+    const state = networkStateFor(tabId);
+    if (typeof requestId === "string" && requestId !== "") state.pending.add(requestId);
+    state.lastActivity = Date.now();
+  }
+
+  function markNetworkDone(tabId, requestId) {
+    const state = networkStateFor(tabId);
+    if (typeof requestId === "string" && requestId !== "") state.pending.delete(requestId);
+    state.lastActivity = Date.now();
+  }
+
+  /**
+   * In-flight requests plus how long the tab has been quiet. A tab with no
+   * recorded activity is idle: Network.enable runs at attach, so anything that
+   * started earlier is outside this session's window (documented limitation).
+   */
+  function networkIdleSnapshot(tabId) {
+    const state = networkByTab.get(tabId);
+    if (state === undefined) return { pendingRequests: 0, idleForMs: Number.POSITIVE_INFINITY };
+    return { pendingRequests: state.pending.size, idleForMs: Date.now() - state.lastActivity };
+  }
+
   function wireDebuggerEvents() {
     if (eventsWired) return;
     eventsWired = true;
@@ -279,8 +375,13 @@ export function createChromeController(chromeApi) {
       } else if (method === "Log.entryAdded") {
         const entry = params?.entry ?? {};
         buffer.push({ type: "log", level: String(entry.level ?? ""), text: String(entry.text ?? "").slice(0, 500), url: entry.url });
-      } else if (method === "Network.loadingFailed") {
-        buffer.push({ type: "network-failed", url: String(params?.url ?? ""), errorText: String(params?.errorText ?? "") });
+      } else if (method === "Network.requestWillBeSent") {
+        markNetworkStarted(tabId, String(params?.requestId ?? ""));
+      } else if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+        markNetworkDone(tabId, String(params?.requestId ?? ""));
+        if (method === "Network.loadingFailed") {
+          buffer.push({ type: "network-failed", url: String(params?.url ?? ""), errorText: String(params?.errorText ?? "") });
+        }
       } else if (method === "Network.responseReceived") {
         const status = Number(params?.response?.status ?? 0);
         if (status >= 400) buffer.push({ type: "network", status, url: String(params?.response?.url ?? "").slice(0, 300) });
@@ -289,6 +390,28 @@ export function createChromeController(chromeApi) {
       }
       if (buffer.length > 120) buffer.splice(0, buffer.length - 120);
     });
+  }
+
+  /**
+   * Chrome-side lifecycle bookkeeping. A tab closed by the user (or a debugger
+   * session Chrome ends itself, e.g. the user dismisses the infobar) must not
+   * leave stale refs/emulation records behind. CDP overrides die with the
+   * session, so removal here only needs to drop bookkeeping.
+   */
+  function wireTabEvents() {
+    const onRemoved = chromeApi.tabs?.onRemoved;
+    if (typeof onRemoved?.addListener === "function") {
+      onRemoved.addListener((tabId) => {
+        if (typeof tabId === "number") releaseTabState(tabId);
+      });
+    }
+    const onDetach = chromeApi.debugger?.onDetach;
+    if (typeof onDetach?.addListener === "function") {
+      onDetach.addListener((source) => {
+        const tabId = source?.tabId;
+        if (typeof tabId === "number") releaseTabState(tabId);
+      });
+    }
   }
 
   /**
@@ -737,11 +860,14 @@ export function createChromeController(chromeApi) {
 
   async function detach(tabId) {
     const id = tabIdOf(tabId);
-    attached.delete(id);
-    refsByTab.delete(id);
-    logBuffers.delete(id);
+    let emulationReset = false;
+    if (emulationByTab.has(id)) {
+      // Restore the user's real tab before the CDP session goes away.
+      emulationReset = (await applyEmulationReset(id)).length === 0;
+    }
+    releaseTabState(id);
     await chromeApi.debugger.detach({ tabId: id });
-    return { ok: true, tabId: id };
+    return { ok: true, tabId: id, ...(emulationReset ? { emulationReset: true } : {}) };
   }
 
   async function navigate(tabId, url) {
@@ -1027,25 +1153,69 @@ export function createChromeController(chromeApi) {
     return { ok: true, tabId: id, value: response?.result?.value ?? null, type: String(response?.result?.type ?? "") };
   }
 
-  async function waitFor(tabId, input) {
+  /**
+   * Wait until every requested condition holds: a selector, body text and/or
+   * network idleness. Conditions are ANDed, polled here, and the caller's `ms`
+   * is still the overall timeout (not a per-condition budget).
+   */
+  async function waitFor(tabId, input = {}) {
     const id = tabIdOf(tabId);
     await assertAgentTab(id);
     await ensureAttached(id);
-    const selector = typeof input.selector === "string" && input.selector !== "" ? input.selector : undefined;
-    const text = typeof input.text === "string" && input.text !== "" ? input.text : undefined;
-    const timeoutMs = Math.max(0, Number(input.ms ?? 8000));
+    const options = input ?? {};
+    const selector = typeof options.selector === "string" && options.selector !== "" ? options.selector : undefined;
+    const text = typeof options.text === "string" && options.text !== "" ? options.text : undefined;
+    const wantsNetworkIdle = options.networkIdle === true;
+    const idleMs = Math.max(0, Number(options.idleMs ?? 500));
+    if (!Number.isFinite(idleMs)) throw new Error("wait idleMs must be a finite number");
+    const timeoutMs = Math.max(0, Number(options.ms ?? 8000));
+    if (!Number.isFinite(timeoutMs)) throw new Error("wait ms must be a finite number");
     const started = Date.now();
-    if (selector === undefined && text === undefined) {
-      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(input.ms ?? 500))));
+    if (selector === undefined && text === undefined && !wantsNetworkIdle) {
+      await delay(Math.max(0, Number(options.ms ?? 500)));
       return { ok: true, tabId: id, waitedMs: Date.now() - started };
     }
-    while (true) {
-      const state = await evaluate(id, WAIT_JS(selector, text));
-      if (state?.found === true) {
-        return { ok: true, tabId: id, waitedMs: Date.now() - started, selector, text };
+    for (;;) {
+      let pageFound = true;
+      let selectorFound;
+      let textFound;
+      if (selector !== undefined || text !== undefined) {
+        const state = await evaluate(id, WAIT_JS(selector, text));
+        pageFound = state?.found === true;
+        selectorFound = state?.selectorFound;
+        textFound = state?.textFound;
       }
-      if (Date.now() - started >= timeoutMs) throw new Error(`wait timed out after ${timeoutMs}ms`);
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      const network = wantsNetworkIdle ? networkIdleSnapshot(id) : undefined;
+      const networkIdleNow = network === undefined || (network.pendingRequests === 0 && network.idleForMs >= idleMs);
+      if (pageFound && networkIdleNow) {
+        return {
+          ok: true,
+          tabId: id,
+          waitedMs: Date.now() - started,
+          ...(selector === undefined ? {} : { selector }),
+          ...(text === undefined ? {} : { text }),
+          ...(selectorFound === undefined ? {} : { selectorFound }),
+          ...(textFound === undefined ? {} : { textFound }),
+          ...(network === undefined
+            ? {}
+            : {
+                networkIdle: {
+                  pendingRequests: network.pendingRequests,
+                  idleMs,
+                  idleForMs: Number.isFinite(network.idleForMs) ? Math.round(network.idleForMs) : null,
+                },
+              }),
+        };
+      }
+      if (Date.now() - started >= timeoutMs) {
+        const pending = wantsNetworkIdle ? networkIdleSnapshot(id) : undefined;
+        throw new Error(
+          `wait timed out after ${timeoutMs}ms${pending === undefined ? "" : ` (network pending ${pending.pendingRequests})`}${
+            selector !== undefined && selectorFound === false ? ` (selector ${JSON.stringify(selector)} not found)` : ""
+          }${text !== undefined && textFound === false ? ` (text ${JSON.stringify(text)} not found)` : ""}`,
+        );
+      }
+      await delay(150);
     }
   }
 
@@ -1072,13 +1242,283 @@ export function createChromeController(chromeApi) {
     };
   }
 
-  async function captureScreenshot(tabId) {
+  function screenshotFormatOf(value) {
+    const raw = typeof value === "string" && value.trim() !== "" ? value.trim().toLowerCase() : "png";
+    const format = raw === "jpg" ? "jpeg" : raw;
+    if (!SCREENSHOT_FORMATS.has(format)) throw new Error(`screenshot format must be png, jpeg or webp, got "${String(value)}"`);
+    return format;
+  }
+
+  function screenshotQualityOf(value, format) {
+    if (value === undefined || value === null) return undefined;
+    const quality = Number(value);
+    if (!Number.isFinite(quality) || quality < 0 || quality > 100) throw new Error("screenshot quality must be a number between 0 and 100");
+    if (format === "png") throw new Error("screenshot quality only applies to format jpeg or webp");
+    return Math.round(quality);
+  }
+
+  function screenshotClipOf(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("screenshot clip must be an object with x, y, width and height");
+    }
+    const clip = {};
+    for (const key of ["x", "y", "width", "height"]) {
+      const number = Number(value[key]);
+      if (!Number.isFinite(number)) throw new Error(`screenshot clip.${key} must be a finite number`);
+      clip[key] = number;
+    }
+    if (clip.width <= 0 || clip.height <= 0) throw new Error("screenshot clip width and height must be positive");
+    if (value.scale !== undefined && value.scale !== null) {
+      const scale = Number(value.scale);
+      if (!Number.isFinite(scale) || scale <= 0) throw new Error("screenshot clip.scale must be a positive number");
+      clip.scale = scale;
+    }
+    return clip;
+  }
+
+  /** Normalise a DOMRect-like value into a positive page-coordinate clip. */
+  function clipFromRect(value) {
+    const x = Number(value?.x);
+    const y = Number(value?.y);
+    const width = Number(value?.width);
+    const height = Number(value?.height);
+    if (![x, y, width, height].every((number) => Number.isFinite(number))) {
+      throw new Error("could not measure the element; take a new snapshot");
+    }
+    if (width <= 0 || height <= 0) throw new Error("the element has no visible box to capture");
+    return { x: Math.max(0, x), y: Math.max(0, y), width, height };
+  }
+
+  /** Page coordinates of an AX ref: resolve the node, then ask the page for its box. */
+  async function refScreenshotClip(tabId, ref, refInfo) {
+    let objectId;
+    try {
+      const resolved = await send(tabId, "DOM.resolveNode", { backendNodeId: refInfo.backendDOMNodeId });
+      if (typeof resolved?.objectId === "string") objectId = resolved.objectId;
+    } catch {
+      objectId = undefined;
+    }
+    if (objectId === undefined) {
+      const nodeId = await axNodeId(tabId, refInfo.backendDOMNodeId);
+      const resolved = await send(tabId, "DOM.resolveNode", { nodeId });
+      if (typeof resolved?.objectId !== "string") throw new Error(`element ref ${ref} could not be resolved; take a new snapshot`);
+      objectId = resolved.objectId;
+    }
+    const response = await send(tabId, "Runtime.callFunctionOn", { objectId, functionDeclaration: ELEMENT_RECT_FN, returnByValue: true });
+    if (response?.exceptionDetails) throw new Error(`element ref ${ref} could not be measured; take a new snapshot`);
+    const clip = clipFromRect(response?.result?.value);
+    // Child-frame refs are measured in their own document; snapshot recorded the
+    // frame's offset relative to the main frame viewport.
+    const offset = refInfo.offset ?? { x: 0, y: 0 };
+    clip.x = Math.max(0, clip.x + Number(offset.x ?? 0));
+    clip.y = Math.max(0, clip.y + Number(offset.y ?? 0));
+    return clip;
+  }
+
+  async function selectorScreenshotClip(tabId, selector) {
+    const value = await evaluate(tabId, SELECTOR_RECT_JS(selector));
+    if (value?.found !== true) throw new Error(`screenshot selector "${selector}" did not match any element`);
+    return clipFromRect(value);
+  }
+
+  /**
+   * Full-page clip from Page.getLayoutMetrics. cssContentSize ignores the
+   * scrollbar-clipped contentSize; when both exist take the larger so the
+   * capture never crops a scrollbar-sized sliver.
+   */
+  async function fullPageScreenshotClip(tabId) {
+    const metrics = await send(tabId, "Page.getLayoutMetrics");
+    const sizes = [metrics?.cssContentSize, metrics?.contentSize].filter((size) => size !== undefined && size !== null);
+    if (sizes.length === 0) throw new Error("the page did not report a content size for fullPage");
+    const width = Math.max(...sizes.map((size) => Number(size.width ?? 0)));
+    const height = Math.max(...sizes.map((size) => Number(size.height ?? 0)));
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      throw new Error("the page reported an empty content size for fullPage");
+    }
+    return { x: 0, y: 0, width: Math.ceil(width), height: Math.ceil(height) };
+  }
+
+  async function pageViewport(tabId) {
+    const value = await evaluate(tabId, VIEWPORT_METRICS_JS);
+    if (value === null || typeof value !== "object") throw new Error("the page did not report its viewport");
+    return {
+      viewport: {
+        width: Number(value.width ?? 0),
+        height: Number(value.height ?? 0),
+        devicePixelRatio: Number(value.devicePixelRatio ?? 0),
+      },
+      colorScheme: typeof value.colorScheme === "string" ? value.colorScheme : undefined,
+    };
+  }
+
+  /** Clear every CDP override this plugin may have applied; each call is isolated. */
+  async function applyEmulationReset(tabId) {
+    const errors = [];
+    for (const [method, params] of EMULATION_RESET_CALLS) {
+      try {
+        await send(tabId, method, params);
+      } catch (error) {
+        errors.push(`${method}: ${String(error && error.message ? error.message : error)}`);
+      }
+    }
+    emulationByTab.delete(tabId);
+    return errors;
+  }
+
+  /**
+   * Parameterised Page.captureScreenshot. A user clip is in page (document)
+   * coordinates; fullPage/ref/selector clips are derived in the same space and
+   * captured with captureBeyondViewport so content below the fold is included.
+   */
+  async function captureScreenshot(tabId, input = {}) {
     const id = tabIdOf(tabId);
     await assertAgentTab(id);
     await ensureAttached(id);
-    const response = await send(id, "Page.captureScreenshot", { format: "png" });
-    if (typeof response?.data !== "string") throw new Error("screenshot failed");
-    return { ok: true, tabId: id, data: response.data };
+    const options = input ?? {};
+    const format = screenshotFormatOf(options.format);
+    const quality = screenshotQualityOf(options.quality, format);
+    const wantsFullPage = options.fullPage === true;
+    const wantsRef = options.ref !== undefined && options.ref !== null && String(options.ref) !== "";
+    const wantsSelector = typeof options.selector === "string" && options.selector.trim() !== "";
+    const explicitClip = options.clip !== undefined && options.clip !== null ? screenshotClipOf(options.clip) : undefined;
+    const modes = [
+      wantsFullPage ? "fullPage" : undefined,
+      wantsRef ? "ref" : undefined,
+      wantsSelector ? "selector" : undefined,
+      explicitClip === undefined ? undefined : "clip",
+    ].filter((mode) => mode !== undefined);
+    if (modes.length > 1) throw new Error(`screenshot accepts only one of fullPage, clip, ref or selector (got ${modes.join(", ")})`);
+    let clip = explicitClip;
+    let mode = explicitClip === undefined ? "viewport" : "clip";
+    if (wantsFullPage) {
+      clip = await fullPageScreenshotClip(id);
+      mode = "fullPage";
+    } else if (wantsRef) {
+      const ref = String(options.ref);
+      const refInfo = refsByTab.get(id)?.get(ref);
+      if (refInfo === undefined) throw new Error(`element ref ${ref} is not in the current snapshot; take a new snapshot`);
+      clip = await refScreenshotClip(id, ref, refInfo);
+      mode = "ref";
+    } else if (wantsSelector) {
+      clip = await selectorScreenshotClip(id, options.selector.trim());
+      mode = "selector";
+    }
+    const params = { format };
+    if (quality !== undefined) params.quality = quality;
+    if (clip !== undefined) {
+      params.clip = clip;
+      params.captureBeyondViewport = true;
+    }
+    const response = await send(id, "Page.captureScreenshot", params);
+    if (typeof response?.data !== "string" || response.data === "") throw new Error("screenshot failed");
+    const scale = clip?.scale ?? 1;
+    return {
+      ok: true,
+      tabId: id,
+      data: response.data,
+      format,
+      ...(quality === undefined ? {} : { quality }),
+      capture: {
+        mode,
+        ...(clip === undefined ? {} : { clip, width: Math.max(1, Math.round(clip.width * scale)), height: Math.max(1, Math.round(clip.height * scale)) }),
+      },
+    };
+  }
+
+  /**
+   * Temporarily emulate a device viewport and/or prefers-color-scheme in this
+   * real tab. The override is recorded per tab and reverted by reset, detach,
+   * closeTab or Chrome ending the debugger session.
+   */
+  async function emulate(tabId, input = {}) {
+    const id = tabIdOf(tabId);
+    await assertAgentTab(id);
+    await ensureAttached(id);
+    const options = input ?? {};
+    if (options.reset === true) {
+      const resetErrors = await applyEmulationReset(id);
+      const measured = await pageViewport(id).catch(() => undefined);
+      return {
+        ok: true,
+        tabId: id,
+        reset: true,
+        viewport: measured?.viewport,
+        colorScheme: measured?.colorScheme,
+        ...(resetErrors.length === 0 ? {} : { resetErrors }),
+      };
+    }
+    const widthGiven = options.width !== undefined && options.width !== null;
+    const heightGiven = options.height !== undefined && options.height !== null;
+    if (widthGiven !== heightGiven) throw new Error("emulate requires both width and height");
+    let width;
+    let height;
+    if (widthGiven) {
+      width = Number(options.width);
+      height = Number(options.height);
+      if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+        throw new Error("emulate width and height must be positive numbers");
+      }
+      width = Math.round(width);
+      height = Math.round(height);
+    }
+    let deviceScaleFactor;
+    if (options.deviceScaleFactor !== undefined && options.deviceScaleFactor !== null) {
+      deviceScaleFactor = Number(options.deviceScaleFactor);
+      if (!Number.isFinite(deviceScaleFactor) || deviceScaleFactor <= 0) throw new Error("emulate deviceScaleFactor must be a positive number");
+      if (!widthGiven) throw new Error("emulate deviceScaleFactor requires width and height");
+    }
+    let mobile;
+    if (options.mobile !== undefined && options.mobile !== null) {
+      if (typeof options.mobile !== "boolean") throw new Error("emulate mobile must be a boolean");
+      mobile = options.mobile;
+      if (!widthGiven) throw new Error("emulate mobile requires width and height");
+    }
+    let colorScheme;
+    if (options.colorScheme !== undefined && options.colorScheme !== null) {
+      colorScheme = String(options.colorScheme).trim().toLowerCase();
+      if (colorScheme !== "light" && colorScheme !== "dark") throw new Error('emulate colorScheme must be "light" or "dark"');
+    }
+    if (!widthGiven && colorScheme === undefined) throw new Error("emulate requires width/height, colorScheme, or reset=true");
+    const previous = emulationByTab.get(id) ?? {};
+    const next = { ...previous };
+    if (widthGiven) {
+      next.width = width;
+      next.height = height;
+      next.deviceScaleFactor = deviceScaleFactor ?? previous.deviceScaleFactor ?? 0;
+      next.mobile = mobile ?? previous.mobile ?? false;
+    }
+    if (colorScheme !== undefined) next.colorScheme = colorScheme;
+    // Record before applying so a partially failed call is still cleared by reset.
+    emulationByTab.set(id, next);
+    if (widthGiven) {
+      await send(id, "Emulation.setDeviceMetricsOverride", {
+        width: next.width,
+        height: next.height,
+        deviceScaleFactor: next.deviceScaleFactor ?? 0,
+        mobile: next.mobile === true,
+        screenWidth: next.width,
+        screenHeight: next.height,
+      });
+    }
+    if (colorScheme !== undefined) {
+      await send(id, "Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: colorScheme }] });
+    }
+    const measured = await pageViewport(id).catch(() => undefined);
+    const emulated = {
+      ...(next.width === undefined
+        ? {}
+        : { width: next.width, height: next.height, deviceScaleFactor: next.deviceScaleFactor ?? 0, mobile: next.mobile === true }),
+      ...(next.colorScheme === undefined ? {} : { colorScheme: next.colorScheme }),
+    };
+    return {
+      ok: true,
+      tabId: id,
+      reset: false,
+      emulated,
+      applied: { deviceMetrics: widthGiven, media: colorScheme !== undefined },
+      viewport: measured?.viewport,
+      colorScheme: next.colorScheme ?? measured?.colorScheme,
+    };
   }
 
   async function newTab(url, options = {}) {
@@ -1091,9 +1531,15 @@ export function createChromeController(chromeApi) {
 
   async function closeTab(tabId) {
     const id = tabIdOf(tabId);
-    attached.delete(id);
+    let emulationReset = false;
+    if (emulationByTab.has(id)) {
+      // Restore the tab before it disappears so a leftover override cannot
+      // outlive the command if Chrome keeps the tab alive for a moment.
+      emulationReset = (await applyEmulationReset(id)).length === 0;
+    }
+    releaseTabState(id);
     await chromeApi.tabs.remove(id);
-    return { ok: true, tabId: id };
+    return { ok: true, tabId: id, ...(emulationReset ? { emulationReset: true } : {}) };
   }
 
   async function execute(command) {
@@ -1130,7 +1576,9 @@ export function createChromeController(chromeApi) {
         case "wait":
           return await waitFor(command.tabId, command);
         case "screenshot":
-          return await captureScreenshot(command.tabId);
+          return await captureScreenshot(command.tabId, command);
+        case "emulate":
+          return await emulate(command.tabId, command);
         default:
           return { ok: false, error: `unknown command ${String(command?.type)}` };
       }
@@ -1139,5 +1587,26 @@ export function createChromeController(chromeApi) {
     }
   }
 
-  return { listTabs, attach, detach, navigate, snapshot, click, type, key, scroll, logs, upload, evaluatePage, waitFor, captureScreenshot, newTab, closeTab, execute };
+  wireTabEvents();
+
+  return {
+    listTabs,
+    attach,
+    detach,
+    navigate,
+    snapshot,
+    click,
+    type,
+    key,
+    scroll,
+    logs,
+    upload,
+    evaluatePage,
+    waitFor,
+    captureScreenshot,
+    emulate,
+    newTab,
+    closeTab,
+    execute,
+  };
 }

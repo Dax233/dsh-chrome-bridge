@@ -562,3 +562,40 @@ token 移出 WS query。
 - 0.1.24：iframe 点击成功后 `changed` 记为 true，不再输出误导性的 "no observable change inside the frame"。
 
 0.1.24 受控复验（2026-10-24）：点击 iframe 内 `GO TO INNER TWO` 输出 `(iframe script click)` 且无 no-observable-change 提示；`contentDocument.location.href` = `/inner2.html`，title/h1 = `Inner Two`。
+
+## 34. CDP 仿真与 QA 参数（2026-10-26）
+
+> 本轮迭代计划里写的编号是「25」，但文档 §25 已被 iframe 支持占用，故按现有编号续到 34。
+
+需求来源：`research/feedback-triage-2026-10-26.md` §1 #13（chrome-bridge 缺 screenshot 参数 / viewport·DPR·主题模拟 / networkidle）。chrome-bridge 的定位不变：驱动**真实 Chrome 标签页**，不是 CI/离屏（triage #14），本轮只补可单测的 CDP 参数面。
+
+### screenshot 参数化（`Page.captureScreenshot`）
+
+- controller `captureScreenshot(tabId, input)`：`format('png'|'jpeg'|'webp')`（默认 png）、`quality(0-100，仅 jpeg/webp)`、`clip{x,y,width,height,scale?}`（有限数、宽高 > 0）、`fullPage`、元素截图 `ref` / `selector`；`fullPage/clip/ref/selector` 互斥。
+- `fullPage`：`Page.getLayoutMetrics` 取 `cssContentSize` 与 `contentSize` 的 **max**（cssContentSize 不受滚动条裁剪），clip `{0,0,ceil(w),ceil(h)}` 且 `captureBeyondViewport:true`。
+- 元素：AX ref 走 `refsByTab` 的 `backendDOMNodeId` → `DOM.resolveNode` → `Runtime.callFunctionOn(this.getBoundingClientRect() + scrollX/Y)`；selector 走 `Runtime.evaluate` 取同样 rect；都是页面（文档）坐标，子 frame ref 再加快照记录的 frame 偏移。
+- 回执 `data + format + capture:{mode, clip, width, height}`（width/height 为 round(clip × scale) 的预估像素）。Host `saveScreenshot(base64, format)` 按格式写 `.png/.jpg/.webp`，解析 PNG/JPEG/WebP 头得到**真实**像素尺寸；文案给出 format/像素/字节/路径，预估与真实不一致时标注 `controller expected ...`。
+- 限制：超大 fullPage 受 Chrome 截图尺寸上限与 Host 20s 命令超时约束；`clip` 使用页面坐标（配合 captureBeyondViewport），不是视口坐标。
+
+### emulate（CDP Emulation + per-tab 自动复位）
+
+- `emulate(tabId, {width?,height?,deviceScaleFactor?,mobile?,colorScheme?,reset?})`：`tabId` 校验 + `assertAgentTab` + `ensureAttached`。
+- set：`width/height` 必须成对；`deviceScaleFactor/mobile` 依赖 width/height；`Emulation.setDeviceMetricsOverride({width,height,deviceScaleFactor,mobile,screenWidth,screenHeight})`；`colorScheme('light'|'dark')` 走 `Emulation.setEmulatedMedia({features:[{name:'prefers-color-scheme',value}]})`。状态按 tab 累加（先只设尺寸再只设配色会保留另一项）。
+- 回执：等一帧后 `Runtime.evaluate` 读页面真实 `innerWidth/innerHeight/devicePixelRatio` 与 `matchMedia('(prefers-color-scheme: dark)')`（rAF 在隐藏标签页会被节流，故与 250ms 定时器竞速兜底），返回 `emulated / applied / viewport / colorScheme`。
+- reset：`Emulation.clearDeviceMetricsOverride` + `Emulation.setEmulatedMedia({features:[]})` + `Emulation.setTouchEmulationEnabled({enabled:false})`（逐个 try/catch，失败进 `resetErrors`）。
+- 自动复位：`detach`、`closeTab` 在结束会话/移除 tab **之前**先复位；`chrome.tabs.onRemoved` / `chrome.debugger.onDetach` 清理 per-tab 记录（Chrome 结束会话时 CDP 覆盖本就随会话丢弃，不会永久留在用户页面）。
+- 边界：真实标签页的显示会被临时改变（这是设计目的）；本轮只做 device metrics + media，**未启用触摸仿真**（`mobile:true` 只影响视口布局），是否要 `setTouchEmulationEnabled` 留给真机验证。
+
+### wait networkIdle
+
+- 事件层按 tab 维护 `{pending:Set<requestId>, lastActivity}`：`Network.requestWillBeSent` 加入，`Network.loadingFinished/loadingFailed` 移除并刷新 lastActivity。
+- `wait {networkIdle, idleMs(default 500)}`：与 selector/text **AND** 轮询；networkIdle 要求 `pending.size === 0` 且静默 ≥ idleMs；总超时仍是 `ms`。回执 `waitedMs` + `networkIdle:{pendingRequests, idleMs, idleForMs}`；超时错误带 pending 数与未命中的条件。
+- 限制：in-flight 统计从 attach（`Network.enable`）之后开始；attach 前已开始、attach 后才结束的请求不在计数内。
+
+### Host / 测试 / 版本
+
+- Host：`ACTIONS` 增加 `emulate`；schema 新增 `fullPage/clip/format/quality/width/height/deviceScaleFactor/mobile/colorScheme/reset/networkIdle/idleMs`；`toCommand` 逐 action 校验并构造命令，`formatResult` 新增 screenshot/emulate 文案（format/像素/路径、viewport/dpr/colorScheme/reset），DESCRIPTION 注明「真实标签页仿真、会临时改变显示、detach/reset 恢复、不适合 CI/离屏」。
+- 测试：controller 新增 15 项（fullPage / jpeg+quality / ref clip / selector+clip / emulate set·reset·colorScheme-only·参数校验 / detach·closeTab·tab 移除复位 / networkIdle 排空·AND·超时 / execute 分派），Host 新增 9 项（schema / toCommand screenshot·emulate·wait / 参数先拒绝 / 图片头尺寸 / 落盘扩展名 / 文案 / 假扩展往返）。全套 **86 项全绿**（基线 62）。
+- 版本：package.json / manifest / Hello 帧统一 0.1.26。
+- 真机复验待做（本轮无法加载新扩展）：`Emulation.*` 参数语义、fullPage 页面坐标、jpeg quality 实际编码、detach 自动复位、networkIdle 事件顺序、超大页面截图；边界见 README「QA 仿真与定位边界」。
+

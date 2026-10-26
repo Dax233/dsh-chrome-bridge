@@ -1,6 +1,6 @@
 # dsh-chrome-bridge
 
-控制用户真实 Chrome 的 DSH 插件：Host 侧 `chrome` 工具 + MV3 扩展（`chrome.debugger`），支持后台标签、DSH Agent 标签组、UIA refs、动作回执、console/network 日志、iframe 观测与 frame 内点击。
+控制用户真实 Chrome 的 DSH 插件：Host 侧 `chrome` 工具 + MV3 扩展（`chrome.debugger`），支持后台标签、DSH Agent 标签组、UIA refs、动作回执、console/network 日志、iframe 观测与 frame 内点击，以及参数化截图（fullPage/clip/元素/格式）、CDP 设备视口与配色仿真、networkIdle 等待。
 
 ## 组成
 
@@ -30,15 +30,27 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 
 ## 工具面
 
-`chrome(action)`：`status`、`tabs`、`newTab`、`closeTab`、`attach`、`detach`、`navigate`、`snapshot`、`click`、`type`、`key`、`scroll`、`screenshot`、`logs`、`upload`、`evaluate`、`wait`。
+`chrome(action)`：`status`、`tabs`、`newTab`、`closeTab`、`attach`、`detach`、`navigate`、`snapshot`、`click`、`type`、`key`、`scroll`、`screenshot`、`emulate`、`logs`、`upload`、`evaluate`、`wait`。
 
 安全/行为要点：
 
 - 只有 **DSH Agent 标签组** 内的 tab 可被驱动；`newTab` 自动入组，`attach` 是显式 opt-in（用户把 tab 拖出组即撤销）。
 - 快照使用 Host 侧 `n<backendNodeId>` refs；动作带 settle/回执。
-- `logs` 支持 `filter`/`clear`；`wait` 支持 selector/text/ms；`upload` 用 `DOM.setFileInputFiles`。
+- `logs` 支持 `filter`/`clear`；`wait` 支持 selector/text/networkIdle/idleMs/ms（多条件 AND）；`upload` 用 `DOM.setFileInputFiles`。
+- `screenshot {format?, quality?, fullPage?, clip?, ref?, selector?}`：CDP `Page.captureScreenshot`；`fullPage`/`clip`/`ref`/`selector` 只能选一种，使用页面坐标；Host 按格式落盘并回填真实像素尺寸。
+- `emulate {width?, height?, deviceScaleFactor?, mobile?, colorScheme?, reset?}`：CDP device metrics + `prefers-color-scheme` 仿真，按 tab 记录，detach/关闭/reset 自动复位。
 - iframe：内容带 `(iframe)` 标记；点击在 frame 隔离世界中按可访问名执行 `.click()`。
 - 本机桥只监听 127.0.0.1，hello 帧 token 鉴权、Host/Origin 校验；默认 token 只用于本机配对，可在扩展选项/环境变量中覆盖。
+
+## QA 仿真与定位边界
+
+`screenshot` / `emulate` / `wait {networkIdle}` 是「改页面 → 多组验收」用的 QA 参数，但它们作用在**用户真实 Chrome 的可见标签页**上：
+
+- `emulate` 调 `Emulation.setDeviceMetricsOverride` + `Emulation.setEmulatedMedia`：该标签页会真的按模拟视口/配色重排。覆盖状态按 tab 记录，`detach`、`closeTab`、`emulate {reset:true}` 会立即复位；Chrome 自己结束调试会话（用户点掉「正在调试此浏览器」提示条）时 CDP 覆盖随会话消失，插件同时清理记录，不会永久留在用户页面上。
+- 只做 device metrics 与 prefers-color-scheme，不启用触摸仿真；`deviceScaleFactor` 是 CDP 视口仿真，不等于真机 DPR。
+- `screenshot`：`fullPage` 取 `Page.getLayoutMetrics` 的 `cssContentSize`/`contentSize` 较大者；`clip`/`ref`/`selector` 使用**页面（文档）坐标**并带 `captureBeyondViewport`；Host 按 format 生成 `.png/.jpg/.webp` 并解析图片头回填真实像素尺寸（控制器用 clip×scale 预估，Host 复核并标注差异）。超大页面的 fullPage 可能受 Chrome 截图上限和 20s 命令超时限制。
+- `wait {networkIdle:true, idleMs}` 从 attach 之后开始统计 `Network.requestWillBeSent` / `loadingFinished|loadingFailed` 的 in-flight；attach 之前已开始的请求不进入计数，`ms` 仍是总超时。
+- **不是 CI/离屏浏览器**：需要真实 Chrome 在运行、扩展已连接。无头/批量验收请用 sidebar 侧栏插件的 `qa` 或外部 CDP/Playwright，本插件不承诺离屏能力。
 
 ## 开发
 
@@ -46,7 +58,7 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 npm test
 ```
 
-测试覆盖 WebSocket 握手/安全、Host 工具往返、扩展 controller、manifest 与 CRX 打包。
+测试覆盖 WebSocket 握手/安全、Host 工具往返、扩展 controller（含截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
 
 ## License
 

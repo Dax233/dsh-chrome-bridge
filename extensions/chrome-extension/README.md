@@ -15,6 +15,7 @@
 - 使用 `chrome.debugger`（Chrome 会显示“正在调试此浏览器”的提示条，属正常，可随时关闭）。
 - 按标签页 attach；**后台标签页也能操作**（不要求前台）。
 - 只允许 http(s) 导航；refs 只对最近一次 snapshot 有效。
+- `screenshot` 通过 `Page.captureScreenshot` 支持 png/jpeg/webp、quality、fullPage、clip 与元素截图；`emulate` 通过 CDP `Emulation.*` 临时改变该标签页的视口/配色（按 tab 记录，detach/关 tab/reset 自动复位；Chrome 结束调试会话时覆盖也随之失效）。
 - 刷新/重载扩展或改端口后，service worker 会按 1 分钟 alarm 自动重连。
 - 不注入远程代码、不使用 content_scripts；页面脚本只在动作执行时通过 `Runtime.evaluate` 求值。
 
