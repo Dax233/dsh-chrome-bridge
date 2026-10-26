@@ -567,7 +567,7 @@ token 移出 WS query。
 
 > 本轮迭代计划里写的编号是「25」，但文档 §25 已被 iframe 支持占用，故按现有编号续到 34。
 
-需求来源：`research/feedback-triage-2026-10-26.md` §1 #13（chrome-bridge 缺 screenshot 参数 / viewport·DPR·主题模拟 / networkidle）。chrome-bridge 的定位不变：驱动**真实 Chrome 标签页**，不是 CI/离屏（triage #14），本轮只补可单测的 CDP 参数面。
+需求来源：`dsh-plugins` 仓库的 `research/feedback-triage-2026-10-26.md` §1 #13（chrome-bridge 缺 screenshot 参数 / viewport·DPR·主题模拟 / networkidle）。chrome-bridge 的定位不变：驱动**真实 Chrome 标签页**，不是 CI/离屏（triage #14），本轮只补可单测的 CDP 参数面。
 
 ### screenshot 参数化（`Page.captureScreenshot`）
 
