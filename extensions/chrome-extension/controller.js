@@ -293,7 +293,12 @@ function tabIdOf(value) {
   return tabId;
 }
 
-export function createChromeController(chromeApi) {
+/**
+ * @param chrome - the MV3 `chrome` API surface used by the controller.
+ * @param options - test hooks: `stalePendingMs` overrides the networkIdle
+ *   abandoned-request window.
+ */
+export function createChromeController(chromeApi, options = {}) {
   const attached = new Set();
   /** tabId -> Map(ref, { backendDOMNodeId, role }); refs are host-side, never in the page. */
   const refsByTab = new Map();
@@ -313,10 +318,17 @@ export function createChromeController(chromeApi) {
     return buffer;
   }
 
-  /** tabId -> { pending: Set<requestId>, lastActivity: epoch ms } for networkIdle waits. */
+  /** tabId -> { pending: Map<requestId, startedAt>, lastActivity: epoch ms } for networkIdle waits. */
   const networkByTab = new Map();
   /** tabId -> accumulated CDP emulation overrides, so detach/close can restore the tab. */
   const emulationByTab = new Map();
+  /**
+   * Older than this, an in-flight request is treated as abandoned. Chromium may
+   * never emit Network.loadingFinished for a response body the page never
+   * consumes (observed with a fire-and-forget `fetch()` on a real tab); clearing
+   * it keeps `wait {networkIdle}` from wedging forever. Overridable in tests.
+   */
+  const stalePendingMs = Number.isFinite(Number(options?.stalePendingMs)) && Number(options.stalePendingMs) > 0 ? Number(options.stalePendingMs) : 120000;
 
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -332,7 +344,7 @@ export function createChromeController(chromeApi) {
   function networkStateFor(tabId) {
     let state = networkByTab.get(tabId);
     if (state === undefined) {
-      state = { pending: new Set(), lastActivity: Date.now() };
+      state = { pending: new Map(), lastActivity: Date.now() };
       networkByTab.set(tabId, state);
     }
     return state;
@@ -340,7 +352,7 @@ export function createChromeController(chromeApi) {
 
   function markNetworkStarted(tabId, requestId) {
     const state = networkStateFor(tabId);
-    if (typeof requestId === "string" && requestId !== "") state.pending.add(requestId);
+    if (typeof requestId === "string" && requestId !== "") state.pending.set(requestId, Date.now());
     state.lastActivity = Date.now();
   }
 
@@ -354,10 +366,17 @@ export function createChromeController(chromeApi) {
    * In-flight requests plus how long the tab has been quiet. A tab with no
    * recorded activity is idle: Network.enable runs at attach, so anything that
    * started earlier is outside this session's window (documented limitation).
+   * Pending entries older than `stalePendingMs` are abandoned (Chromium can
+   * withhold loadingFinished for an unread response body), so they must not
+   * wedge networkIdle forever.
    */
   function networkIdleSnapshot(tabId) {
     const state = networkByTab.get(tabId);
     if (state === undefined) return { pendingRequests: 0, idleForMs: Number.POSITIVE_INFINITY };
+    const cutoff = Date.now() - stalePendingMs;
+    for (const [requestId, startedAt] of state.pending) {
+      if (!(startedAt > cutoff)) state.pending.delete(requestId);
+    }
     return { pendingRequests: state.pending.size, idleForMs: Date.now() - state.lastActivity };
   }
 
@@ -1402,6 +1421,15 @@ export function createChromeController(chromeApi) {
     } else if (wantsSelector) {
       clip = await selectorScreenshotClip(id, options.selector.trim());
       mode = "selector";
+    }
+    if (clip !== undefined) {
+      // Chromium's Page.captureScreenshot treats clip.scale as mandatory (a
+      // missing scale fails the whole call with "Failed to deserialize
+      // params.clip.scale - BINDINGS: mandatory field missing", observed on a
+      // real tab). Normalise it here for user clips and derived fullPage/ref/
+      // selector clips alike.
+      const scale = Number(clip.scale);
+      clip = { ...clip, scale: Number.isFinite(scale) && scale > 0 ? scale : 1 };
     }
     const params = { format };
     if (quality !== undefined) params.quality = quality;

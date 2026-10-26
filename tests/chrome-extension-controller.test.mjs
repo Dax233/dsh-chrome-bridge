@@ -546,11 +546,11 @@ test("screenshot fullPage clips the whole content and captures beyond the viewpo
   assert.equal(result.ok, true);
   assert.equal(result.format, "png");
   assert.equal(result.capture.mode, "fullPage");
-  assert.deepEqual(result.capture.clip, { x: 0, y: 0, width: 1200, height: 3000 }, "the larger content size wins");
+  assert.deepEqual(result.capture.clip, { x: 0, y: 0, width: 1200, height: 3000, scale: 1 }, "the larger content size wins; scale defaults to 1");
   assert.equal(result.capture.width, 1200);
   assert.equal(result.capture.height, 3000);
   const shot = calls.find((call) => call.cdp === "Page.captureScreenshot");
-  assert.deepEqual(shot.params.clip, { x: 0, y: 0, width: 1200, height: 3000 });
+  assert.deepEqual(shot.params.clip, { x: 0, y: 0, width: 1200, height: 3000, scale: 1 }, "CDP requires clip.scale (mandatory)");
   assert.equal(shot.params.captureBeyondViewport, true);
   assert.equal(shot.params.format, "png");
 });
@@ -581,7 +581,7 @@ test("screenshot of an AX ref resolves the node and clips its page box", async (
   await controller.snapshot(1);
   const result = await controller.captureScreenshot(1, { ref: "n123" });
   assert.equal(result.capture.mode, "ref");
-  assert.deepEqual(result.capture.clip, { x: 100, y: 250, width: 80, height: 40 });
+  assert.deepEqual(result.capture.clip, { x: 100, y: 250, width: 80, height: 40, scale: 1 });
   assert.equal(result.capture.width, 80);
   assert.equal(result.capture.height, 40);
   const resolve = calls.find((call) => call.cdp === "DOM.resolveNode" && call.params.backendNodeId === 123);
@@ -599,7 +599,7 @@ test("screenshot selector and explicit clips use page coordinates", async () => 
   const controller = createChromeController(chromeApi);
   const bySelector = await controller.captureScreenshot(1, { selector: "#hero" });
   assert.equal(bySelector.capture.mode, "selector");
-  assert.deepEqual(bySelector.capture.clip, { x: 15, y: 25, width: 200, height: 100 });
+  assert.deepEqual(bySelector.capture.clip, { x: 15, y: 25, width: 200, height: 100, scale: 1 });
   const selectorEval = calls.find(
     (call) => call.cdp === "Runtime.evaluate" && String(call.params.expression).includes("__dshAgentSelectorRect"),
   );
@@ -758,6 +758,18 @@ test("wait networkIdle reports pending requests when it times out", async () => 
   await controller.attach(1);
   state.debuggerListeners[0]({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "never-finishes" });
   await assert.rejects(() => controller.waitFor(1, { networkIdle: true, idleMs: 10, ms: 120 }), /timed out.*network pending 1/);
+});
+
+test("wait networkIdle forgets abandoned requests that never emit loadingFinished", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi, { stalePendingMs: 40 });
+  await controller.attach(1);
+  // Real Chromium can withhold loadingFinished for a response body the page
+  // never consumes (observed with a fire-and-forget fetch on a live tab).
+  state.debuggerListeners[0]({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "unconsumed-fetch" });
+  const result = await controller.waitFor(1, { networkIdle: true, idleMs: 0, ms: 1000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.networkIdle.pendingRequests, 0, "stale pending entries must not wedge networkIdle");
 });
 
 test("execute dispatches screenshot QA parameters, emulate and networkIdle waits", async () => {

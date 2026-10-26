@@ -595,7 +595,21 @@ token 移出 WS query。
 ### Host / 测试 / 版本
 
 - Host：`ACTIONS` 增加 `emulate`；schema 新增 `fullPage/clip/format/quality/width/height/deviceScaleFactor/mobile/colorScheme/reset/networkIdle/idleMs`；`toCommand` 逐 action 校验并构造命令，`formatResult` 新增 screenshot/emulate 文案（format/像素/路径、viewport/dpr/colorScheme/reset），DESCRIPTION 注明「真实标签页仿真、会临时改变显示、detach/reset 恢复、不适合 CI/离屏」。
-- 测试：controller 新增 15 项（fullPage / jpeg+quality / ref clip / selector+clip / emulate set·reset·colorScheme-only·参数校验 / detach·closeTab·tab 移除复位 / networkIdle 排空·AND·超时 / execute 分派），Host 新增 9 项（schema / toCommand screenshot·emulate·wait / 参数先拒绝 / 图片头尺寸 / 落盘扩展名 / 文案 / 假扩展往返）。全套 **86 项全绿**（基线 62）。
-- 版本：package.json / manifest / Hello 帧统一 0.1.26。
-- 真机复验待做（本轮无法加载新扩展）：`Emulation.*` 参数语义、fullPage 页面坐标、jpeg quality 实际编码、detach 自动复位、networkIdle 事件顺序、超大页面截图；边界见 README「QA 仿真与定位边界」。
+- 测试：controller 新增 15 项（fullPage / jpeg+quality / ref clip / selector+clip / emulate set·reset·colorScheme-only·参数校验 / detach·closeTab·tab 移除复位 / networkIdle 排空·AND·超时 / execute 分派），Host 新增 9 项（schema / toCommand screenshot·emulate·wait / 参数先拒绝 / 图片头尺寸 / 落盘扩展名 / 文案 / 假扩展往返）。全套 **87 项全绿**（基线 62，0.1.27 再 +1 陈旧请求清理）。
+- 版本：package.json / manifest / Hello 帧统一 0.1.27。
+
+### 34.6 真机首验记录（2026-10-26，0.1.26 → 0.1.27）
+
+扩展 reload 到 0.1.26 + Host 重启后，在真实 Chrome 上验证（新建后台 tab → attach）：
+
+- **通过**：`newTab`/`attach`/`snapshot`（1662x1355 前台视口）、`emulate {width:390,height:844,deviceScaleFactor:3,mobile:true,colorScheme:"dark"}`（页面回读 `innerWidth=390, innerHeight=844, dpr=3, prefers-dark=true`）、viewport PNG/JPEG 截图（1170x2532 = 390x844 @3x，`read_image` 内容正确、深色配色生效）、`evaluate`、`logs`（console error 与 network-failed 都能读到）、`emulate {reset:true}`（回读 1662x1299 @1x）、`closeTab`。
+- **bug 1：clip.scale 必填**。`screenshot {fullPage:true}` 真机报
+  `Failed to deserialize params.clip.scale - BINDINGS: mandatory field missing`；当前 Chrome 把
+  `clip.scale` 当必填。0.1.27 对所有 clip（用户 clip、fullPage、ref、selector）统一补 `scale: 1`。
+- **bug 2：networkIdle 可能挂住**。真机上用 `evaluate` 发一个**不读取 body** 的 `fetch('/slow.png')`，
+  Chromium 不发 `Network.loadingFinished`，`pending` 永久停在 1，`wait {networkIdle}` 只能超时。
+  0.1.27 给 pending 加 startedAt，超过 `stalePendingMs`（默认 120s，测试可覆盖）的请求视为放弃并清出；
+  正常资源（图片/CSS/JS，body 被消费）仍按 loadingFinished 精确排空。
+- 待下一轮扩展 reload 后复验：fullPage 实际像素、ref/selector/clip 元素截图、`networkIdle` 在慢页面上的
+  等待时长（已用本地 slow probe 观察 requestWillBeSent 计数正确）。
 

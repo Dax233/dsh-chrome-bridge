@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-chrome-bridge",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "private": true,
   "type": "module",
   "description": "Host bridge for the DSH Chrome extension: a loopback WebSocket server plus a `chrome` tool that drives the user's real Chrome tabs through chrome.debugger.",
