@@ -343,6 +343,17 @@ export function createChromeController(chromeApi, options = {}) {
    */
   const stalePendingMs = Number.isFinite(Number(options?.stalePendingMs)) && Number(options.stalePendingMs) > 0 ? Number(options.stalePendingMs) : 120000;
 
+  /**
+   * Network.requestWillBeSent `type` values that never pair with a
+   * loadingFinished (WebSocket/EventSource are long-lived connections) or say
+   * nothing about the page settling down (beacon pings, prefetches, CSP
+   * violation reports). GitHub fires these constantly, so counting them makes
+   * `wait {networkIdle}` wedge until the command timeout. They are excluded
+   * from the pending count and from lastActivity; the totals are reported back
+   * as `networkIdle.ignoredTypes` so callers can see what was ignored.
+   */
+  const IGNORED_NETWORK_TYPES = new Set(["WebSocket", "EventSource", "Ping", "CSPViolationReport", "Prefetch"]);
+
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   /** Drop every per-tab record; used by detach, closeTab and Chrome-side tab removal. */
@@ -357,14 +368,18 @@ export function createChromeController(chromeApi, options = {}) {
   function networkStateFor(tabId) {
     let state = networkByTab.get(tabId);
     if (state === undefined) {
-      state = { pending: new Map(), lastActivity: Date.now() };
+      state = { pending: new Map(), lastActivity: Date.now(), ignored: new Map() };
       networkByTab.set(tabId, state);
     }
     return state;
   }
 
-  function markNetworkStarted(tabId, requestId) {
+  function markNetworkStarted(tabId, requestId, type) {
     const state = networkStateFor(tabId);
+    if (typeof type === "string" && IGNORED_NETWORK_TYPES.has(type)) {
+      state.ignored.set(type, (state.ignored.get(type) ?? 0) + 1);
+      return;
+    }
     if (typeof requestId === "string" && requestId !== "") state.pending.set(requestId, Date.now());
     state.lastActivity = Date.now();
   }
@@ -390,7 +405,9 @@ export function createChromeController(chromeApi, options = {}) {
     for (const [requestId, startedAt] of state.pending) {
       if (!(startedAt > cutoff)) state.pending.delete(requestId);
     }
-    return { pendingRequests: state.pending.size, idleForMs: Date.now() - state.lastActivity };
+    const ignoredTypes = {};
+    for (const [type, count] of state.ignored) ignoredTypes[type] = count;
+    return { pendingRequests: state.pending.size, idleForMs: Date.now() - state.lastActivity, ignoredTypes };
   }
 
   function wireDebuggerEvents() {
@@ -408,7 +425,7 @@ export function createChromeController(chromeApi, options = {}) {
         const entry = params?.entry ?? {};
         buffer.push({ type: "log", level: String(entry.level ?? ""), text: String(entry.text ?? "").slice(0, 500), url: entry.url });
       } else if (method === "Network.requestWillBeSent") {
-        markNetworkStarted(tabId, String(params?.requestId ?? ""));
+        markNetworkStarted(tabId, String(params?.requestId ?? ""), typeof params?.type === "string" ? params.type : undefined);
       } else if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
         markNetworkDone(tabId, String(params?.requestId ?? ""));
         if (method === "Network.loadingFailed") {
@@ -1220,6 +1237,8 @@ export function createChromeController(chromeApi, options = {}) {
       const network = wantsNetworkIdle ? networkIdleSnapshot(id) : undefined;
       const networkIdleNow = network === undefined || (network.pendingRequests === 0 && network.idleForMs >= idleMs);
       if (pageFound && networkIdleNow) {
+        const ignored = network === undefined ? {} : (network.ignoredTypes ?? {});
+        const hasIgnored = Object.keys(ignored).length > 0;
         return {
           ok: true,
           tabId: id,
@@ -1235,12 +1254,39 @@ export function createChromeController(chromeApi, options = {}) {
                   pendingRequests: network.pendingRequests,
                   idleMs,
                   idleForMs: Number.isFinite(network.idleForMs) ? Math.round(network.idleForMs) : null,
+                  ...(hasIgnored ? { ignoredTypes: ignored } : {}),
                 },
               }),
         };
       }
       if (Date.now() - started >= timeoutMs) {
         const pending = wantsNetworkIdle ? networkIdleSnapshot(id) : undefined;
+        const ignored = pending?.ignoredTypes ?? {};
+        const hasIgnored = Object.keys(ignored).length > 0;
+        // Best-effort success: when the page conditions (selector/text) are met
+        // or not requested, and ONLY networkIdle is unmet, long-lived requests
+        // (beacons, WebSockets, SSE) are usually the culprit and may never go
+        // idle. Reporting beats timing out the whole command.
+        if (pending !== undefined && pageFound) {
+          const warning = `networkIdle not reached within ${timeoutMs}ms: best-effort continuation (${pending.pendingRequests} pending${hasIgnored ? `, ignored types ${JSON.stringify(ignored)}` : ""}; long-lived requests such as beacons may never reach idle)`;
+          return {
+            ok: true,
+            tabId: id,
+            waitedMs: Date.now() - started,
+            ...(selector === undefined ? {} : { selector }),
+            ...(text === undefined ? {} : { text }),
+            ...(selectorFound === undefined ? {} : { selectorFound }),
+            ...(textFound === undefined ? {} : { textFound }),
+            networkIdle: {
+              pendingRequests: pending.pendingRequests,
+              idleMs,
+              idleForMs: Number.isFinite(pending.idleForMs) ? Math.round(pending.idleForMs) : null,
+              timedOut: true,
+              ...(hasIgnored ? { ignoredTypes: ignored } : {}),
+            },
+            warning,
+          };
+        }
         throw new Error(
           `wait timed out after ${timeoutMs}ms${pending === undefined ? "" : ` (network pending ${pending.pendingRequests})`}${
             selector !== undefined && selectorFound === false ? ` (selector ${JSON.stringify(selector)} not found)` : ""

@@ -51,6 +51,9 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 - 只做 device metrics 与 prefers-color-scheme，不启用触摸仿真；`deviceScaleFactor` 是 CDP 视口仿真，不等于真机 DPR。
 - `screenshot`：`fullPage` 取 `Page.getLayoutMetrics` 的 `cssContentSize`/`contentSize` 较大者作为目标高度（上限 12000 CSS px），**临时把当前仿真视口的高度改成该高度、截图后恢复**——不用 `captureBeyondViewport`：真机 Chrome 156 在后台 tab 上对它（带不带 clip 都一样）会永不返回、还会把 tab 留在截图尺寸。`clip`/`ref`/`selector` 都是**视口坐标**并只截可见表面（ref/selector 先 `scrollIntoView`）；`clip.scale` 当前 CDP 必填，控制器统一补默认 1（用户传的 scale 保留）。base64 超过桥 7MB 帧预算会直接报错（提示降 deviceScaleFactor / 改 clip）。Host 按 format 生成 `.png/.jpg/.webp` 并解析图片头回填真实像素尺寸。
 - `wait {networkIdle:true, idleMs}` 从 attach 之后开始统计 `Network.requestWillBeSent` / `loadingFinished|loadingFailed` 的 in-flight；attach 之前已开始的请求不进入计数，`ms` 仍是总超时。超过 120s 仍未 finish 的请求视为被放弃（真机上页面 `fetch()` 不消费 body 时 Chromium 可能永远不发 `loadingFinished`），会被清出计数，避免 networkIdle 永久挂住。
+- `wait {networkIdle}` 从 0.1.30 起忽略 **WebSocket / EventSource / Ping / CSPViolationReport / Prefetch** 类型的请求（GitHub 的 beacon/长连接永不 `loadingFinished`，会把 pending 永久卡在非零）；总超时到达时若只有 networkIdle 未满足，返回**best-effort 成功**：`ok:true + networkIdle:{timedOut:true, pendingRequests, ignoredTypes?} + warning`（Host 文案标注 "best-effort: still N pending (long-lived requests such as beacons may never reach idle)"），不再让命令失败。selector/text 未找到的超时仍照常报错。
+- `emulate {reset:true}` 的回执 colorScheme 反映的是**页面真实偏好**：reset 只清 CDP 覆盖，Chrome 页面的 prefers-color-scheme 跟随 Chrome 主题/系统策略，可能与你预期的 OS/系统配色不一致（如系统 dark 但 Chrome 主题 light 页面报 light）。这是 Chrome 行为，不是 bug。
+- 登录账号的 GitHub 用页面级 `data-color-mode` 强制裁剪：真实 Chrome 里 CDP `colorScheme` 可能改不动它的配色。主题相关的 QA 建议在**未登录 / 独立 profile / 无痕**窗口里做。
 - **不是 CI/离屏浏览器**：需要真实 Chrome 在运行、扩展已连接。无头/批量验收请用 sidebar 侧栏插件的 `qa` 或外部 CDP/Playwright，本插件不承诺离屏能力。
 
 ## 开发

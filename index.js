@@ -536,8 +536,14 @@ function formatResult(action, value) {
         conditions.push(
           ` until network idle (${Number(value.networkIdle.idleMs ?? 0)}ms, ${Number(value.networkIdle.pendingRequests ?? 0)} pending)`,
         );
+        if (value.networkIdle.timedOut === true) {
+          conditions.push(
+            `; best-effort: still ${Number(value.networkIdle.pendingRequests ?? 0)} pending (long-lived requests such as beacons may never reach idle)`,
+          );
+        }
       }
-      return `waited ${String(value.waitedMs ?? 0)}ms in tab ${value.tabId}${conditions.join("")}`;
+      const warning = typeof value.warning === "string" && value.warning.trim() !== "" ? ` [${value.warning.trim()}]` : "";
+      return `waited ${String(value.waitedMs ?? 0)}ms in tab ${value.tabId}${conditions.join("")}${warning}`;
     }
     default:
       return `${action}: ok`;

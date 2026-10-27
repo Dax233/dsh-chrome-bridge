@@ -589,8 +589,10 @@ token 移出 WS query。
 ### wait networkIdle
 
 - 事件层按 tab 维护 `{pending:Set<requestId>, lastActivity}`：`Network.requestWillBeSent` 加入，`Network.loadingFinished/loadingFailed` 移除并刷新 lastActivity。
-- `wait {networkIdle, idleMs(default 500)}`：与 selector/text **AND** 轮询；networkIdle 要求 `pending.size === 0` 且静默 ≥ idleMs；总超时仍是 `ms`。回执 `waitedMs` + `networkIdle:{pendingRequests, idleMs, idleForMs}`；超时错误带 pending 数与未命中的条件。
-- 限制：in-flight 统计从 attach（`Network.enable`）之后开始；attach 前已开始、attach 后才结束的请求不在计数内。
+- **忽略类型集合**：`Network.requestWillBeSent` 的 `payload.type` 属于 `IGNORED_NETWORK_TYPES = {WebSocket, EventSource, Ping, CSPViolationReport, Prefetch}` 的请求**不进 pending、不刷新 lastActivity**（计数记入 `state.ignored`，回执以 `networkIdle.ignoredTypes` 报出）。这类请求（GitHub 的 beacon/长连接）永不按对产生 `loadingFinished`，计进去会让 pending 永不清零；`loadingFinished/Failed` 对它们的 delete 是无害 no-op。
+- `wait {networkIdle, idleMs(default 500)}`：与 selector/text **AND** 轮询；networkIdle 要求 `pending.size === 0` 且静默 ≥ idleMs；总超时仍是 `ms`。回执 `waitedMs` + `networkIdle:{pendingRequests, idleMs, idleForMs(, ignoredTypes)(, timedOut)}`。
+- **best-effort 超时**：到 `ms` 时若**只有 networkIdle 未满足**（selector/text 已满足或未要求），返回 `ok:true, waitedMs, networkIdle:{..., timedOut:true, ignoredTypes?}, warning` 而不是抛错（0.1.30 起；此前 github.com 因 beacon 长连接必然 20–30s 超时失败）。warning 文案含 pending 数与「long-lived requests such as beacons may never reach idle」；Host `formatResult` 在 network idle 文案后追加 `best-effort: still N pending (...)` 并回显 warning。**selector/text 未满足的超时仍按原样报错**（错误信息仍带 pending 数与未命中条件）。
+- 限制：in-flight 统计从 attach（`Network.enable`）之后开始；attach 前已开始、attach 后才结束的请求不在计数内。`stalePendingMs` 默认 120s 保留（best-effort 超时后不再需要它兜住整体命令），测试可覆盖。
 
 ### Host / 测试 / 版本
 
@@ -645,4 +647,28 @@ token 移出 WS query。
   call），clip 成功、selector 永久挂住；单独重试 selector 正常。0.1.29 在 `background.js` 里把命令
   串行化（一条 promise 队列），从协议层消除同 tab 并发 CDP 命令的互相踩踏。
 - 测试：新增 service worker 串行化断言；全套 **88 项全绿**。版本 0.1.29。
+
+### 34.9 第五轮修复（2026-10-27，0.1.29 → 0.1.30）
+
+反馈真机现象（Lead 复现）：`wait {tabId, networkIdle:true}` 在 github.com 两次 20–30s 超时
+（`no extension result before timeout`），`wait {ms}` 与 selector-only 正常。原因：GitHub 有
+beacon/长连接请求（Ping/WebSocket 等）不按对产生 `Network.loadingFinished`，pending 永不清零，
+而 `stalePendingMs=120s` 大于 Host 20s 命令超时，超时前永不放行。
+
+0.1.30：
+
+- `controller.js`：新增 `IGNORED_NETWORK_TYPES = {WebSocket, EventSource, Ping, CSPViolationReport, Prefetch}`，
+  这些类型的 `requestWillBeSent` 不进 pending、不刷新 lastActivity（`networkIdle.ignoredTypes` 报出计数）。
+- `waitFor` 超时改 best-effort：只有 networkIdle 未满足时返回 `ok:true + networkIdle:{timedOut:true,
+  pendingRequests, idleForMs, ignoredTypes?} + warning`，不再让命令失败；selector/text 未满足仍报错。
+- Host `formatResult`：best-effort 文案 `best-effort: still N pending (long-lived requests such as
+  beacons may never reach idle)` + 回显 warning。
+- 测试：controller 新增 3 项（忽略类型不阻塞 idle、networkIdle-only 超时 best-effort ok、selector 超时仍失败），
+  原 networkIdle-only 超时断言随之改为 best-effort 断言；Host 新增 1 项 best-effort 文案测试。
+- 文档边界（不是 bug）：`emulate reset` 后回执 colorScheme 反映的是**页面真实偏好**——reset 只清 CDP
+  覆盖，Chrome 页面的 prefers-color-scheme 跟随 Chrome 主题/系统策略，可能与 OS 不一致；真实 Chrome
+  里登录账号的 GitHub 用 `data-color-mode=dark` 强制配色时，CDP `colorScheme` 改不动页面，主题 QA 建议
+  未登录/独立 profile/无痕。
+- 待真机复验（需 reload 扩展 0.1.30）：github.com 上 `wait {networkIdle:true}` 应在 ms 内 best-effort
+  返回 ok + pending + warning；普通页面仍真正等 idle。版本 0.1.30。
 

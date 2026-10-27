@@ -89,7 +89,7 @@ function makeChromeMock() {
           if (expression.includes("__dshAgentScrollState")) return { result: { value: state.evaluateResults.scrollState } };
           if (expression.includes("__dshAgentFocusedValue")) return { result: { value: state.evaluateResults.focusedValue } };
           if (expression.includes("__dshAgentEditable")) return { result: { value: state.editable ?? { editable: true, tag: "input", value: "hello" } } };
-          if (expression.includes("__dshAgentWait")) return { result: { value: { found: true, selectorFound: true, textFound: true } } };
+          if (expression.includes("__dshAgentWait")) return { result: { value: state.waitResult ?? { found: true, selectorFound: true, textFound: true } } };
           if (expression.includes("__dshAgentViewportMetrics")) {
             return { result: { value: state.pageMetrics ?? { width: 1280, height: 800, devicePixelRatio: 1, colorScheme: "light" } } };
           }
@@ -799,12 +799,51 @@ test("wait ANDs the page condition with networkIdle", async () => {
   assert.ok(result.waitedMs >= 100, `the selector alone was not enough; got ${result.waitedMs}ms`);
 });
 
-test("wait networkIdle reports pending requests when it times out", async () => {
+test("wait networkIdle-only timeout is best-effort ok with a warning and pending count", async () => {
   const { chromeApi, state } = makeChromeMock();
   const controller = createChromeController(chromeApi);
   await controller.attach(1);
+  // GitHub-style beacon: recorded but long-lived, so networkIdle never settles.
   state.debuggerListeners[0]({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "never-finishes" });
-  await assert.rejects(() => controller.waitFor(1, { networkIdle: true, idleMs: 10, ms: 120 }), /timed out.*network pending 1/);
+  const result = await controller.waitFor(1, { networkIdle: true, idleMs: 10, ms: 120 });
+  assert.equal(result.ok, true, "a networkIdle-only timeout must not fail the command");
+  assert.match(result.warning, /best-effort/);
+  assert.match(result.warning, /long-lived requests/);
+  assert.equal(result.networkIdle.pendingRequests, 1);
+  assert.equal(result.networkIdle.timedOut, true);
+});
+
+test("wait ignores long-lived request types (WebSocket/EventSource/Ping) for networkIdle", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  const listener = state.debuggerListeners[0];
+  // Beacon fire-and-forget requests never emit loadingFinished; they must not
+  // enter the pending count at all (github.com wedged networkIdle this way).
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "ws1", type: "WebSocket", request: { url: "wss://example.com/ws" } });
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "sse1", type: "EventSource", request: { url: "https://example.com/sse" } });
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "beacon1", type: "Ping", request: { url: "https://github.com/_private/browser/stats" } });
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "prefetch1", type: "Prefetch" });
+  listener({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "csp1", type: "CSPViolationReport" });
+  // Finishing an ignored request must stay a harmless no-op.
+  listener({ tabId: 1 }, "Network.loadingFinished", { requestId: "ws1" });
+  const result = await controller.waitFor(1, { networkIdle: true, idleMs: 20, ms: 2000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.networkIdle.pendingRequests, 0, "ignored request types must not block networkIdle");
+  assert.equal(result.networkIdle.timedOut, undefined, "idle was actually reached, not best-effort");
+  assert.deepEqual(result.networkIdle.ignoredTypes, { WebSocket: 1, EventSource: 1, Ping: 1, Prefetch: 1, CSPViolationReport: 1 });
+});
+
+test("wait still fails when the selector (not only networkIdle) times out", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  state.debuggerListeners[0]({ tabId: 1 }, "Network.requestWillBeSent", { requestId: "r-b" });
+  state.waitResult = { found: false, selectorFound: false, textFound: true };
+  await assert.rejects(
+    () => controller.waitFor(1, { selector: "#never", networkIdle: true, idleMs: 10, ms: 120 }),
+    /timed out.*network pending 1.*#never.*not found/,
+  );
 });
 
 test("wait networkIdle forgets abandoned requests that never emit loadingFinished", async () => {

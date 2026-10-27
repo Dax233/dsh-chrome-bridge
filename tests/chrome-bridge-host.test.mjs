@@ -504,6 +504,19 @@ test("wait networkIdle is validated and formatted", () => {
   assert.match(text, /network idle \(500ms, 0 pending\)/);
 });
 
+test("wait best-effort networkIdle is formatted with the long-lived-requests note", () => {
+  const { formatResult } = plugin.__test;
+  const text = formatResult("wait", {
+    tabId: 7,
+    waitedMs: 2000,
+    networkIdle: { pendingRequests: 3, idleMs: 500, idleForMs: 120, timedOut: true, ignoredTypes: { WebSocket: 2 } },
+    warning: "networkIdle not reached within 2000ms: best-effort continuation (3 pending...)",
+  });
+  assert.match(text, /waited 2000ms/);
+  assert.match(text, /best-effort: still 3 pending \(long-lived requests such as beacons may never reach idle\)/);
+  assert.match(text, /\[.*best-effort.*\]/);
+});
+
 test("screenshot image headers yield real pixel dimensions", () => {
   const { imageSize } = plugin.__test;
   assert.deepEqual(imageSize(makePngHeader(640, 480), "png"), { width: 640, height: 480 });
