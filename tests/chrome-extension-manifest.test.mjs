@@ -36,6 +36,7 @@ test("service worker imports the controller and keeps a WebSocket connection", (
   assert.match(background, /type: "hello"/);
   assert.match(background, /type: "result"/);
   assert.match(background, /type: "pong"/, "the service worker must answer the keepalive heartbeat");
+  assert.match(background, /commandQueue = commandQueue/, "commands must be serialized (concurrent CDP calls can hang)");
 });
 
 test("extension ships no remote code or content scripts", () => {

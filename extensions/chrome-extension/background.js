@@ -49,11 +49,16 @@ async function connect() {
     attempt = 0;
     try {
       // The token is a handshake field, not a URL query: URLs leak into logs.
-      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.28", token }));
+      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.29", token }));
     } catch {
       // The close handler will reconnect.
     }
   });
+  // Commands must run one at a time: two concurrent chrome.debugger commands on
+  // the same tab can deadlock (observed: a selector screenshot hung forever while
+  // a parallel clip screenshot succeeded). The Host may issue overlapping tool
+  // calls, so serialize here instead of relying on the caller.
+  let commandQueue = Promise.resolve();
   ws.addEventListener("message", (event) => {
     void (async () => {
       let message;
@@ -74,12 +79,19 @@ async function connect() {
         return;
       }
       if (message.type !== "command" || typeof message.id !== "string") return;
-      const result = await controller.execute(message.cmd);
-      try {
-        ws.send(JSON.stringify({ type: "result", id: message.id, result }));
-      } catch {
-        // Connection died mid-command; the Host times out and the next connect resumes.
-      }
+      const socket = ws;
+      commandQueue = commandQueue
+        .then(async () => {
+          const result = await controller.execute(message.cmd);
+          try {
+            socket.send(JSON.stringify({ type: "result", id: message.id, result }));
+          } catch {
+            // Connection died mid-command; the Host times out and the next connect resumes.
+          }
+        })
+        .catch(() => {
+          // A failed command is reported through its own result; keep the queue alive.
+        });
     })();
   });
   ws.addEventListener("close", () => {

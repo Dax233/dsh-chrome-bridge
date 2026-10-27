@@ -40,6 +40,7 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 - `screenshot {format?, quality?, fullPage?, clip?, ref?, selector?}`：`fullPage`/`clip`/`ref`/`selector` 只能选一种；`clip` 是**视口（CSS px）坐标**，`ref`/`selector` 会先滚动到目标再按视口坐标截取；`fullPage` 临时把仿真视口拉高到内容高度再截、随后恢复。Host 按格式落盘并回填真实像素尺寸。
 - `emulate {width?, height?, deviceScaleFactor?, mobile?, colorScheme?, reset?}`：CDP device metrics + `prefers-color-scheme` 仿真，按 tab 记录，detach/关闭/reset 自动复位。
 - iframe：内容带 `(iframe)` 标记；点击在 frame 隔离世界中按可访问名执行 `.click()`。
+- 命令在扩展服务端**串行执行**（`background.js` 维护一条 promise 队列）：agent 并发发起多个工具调用时，同一个 tab 上的 CDP 命令不会互相踩踏（真机上并发 selector/clip 截图曾让其中一个永久挂住）。
 - 本机桥只监听 127.0.0.1，hello 帧 token 鉴权、Host/Origin 校验；默认 token 只用于本机配对，可在扩展选项/环境变量中覆盖。
 
 ## QA 仿真与定位边界

@@ -631,3 +631,18 @@ token 移出 WS query。
   与 awaitPromise、clip 视口裁剪、`captureBeyondViewport` 不再出现；全套 **88 项全绿**。
 - 版本：package.json / manifest / Hello 帧统一 0.1.28。真机复验需再 reload 扩展一次。
 
+### 34.8 第四轮真机（2026-10-27，0.1.28 → 0.1.29）
+
+0.1.28 reload 后在真实 Chrome 156 上复验：
+
+- **fullPage 通过**：390x844 @2x + dark 下得到 **780x7000 px**（= 390×3500 × dsf2），读图确认 5 个
+  section/颜色/badge 全部正确；截完回读视口仍是 390x844 @2x，没有 34.7 里那种 tab 被卡在截图尺寸的问题。
+- **clip 通过**：`{x:20,y:100,width:300,height:200}` → 600x400 px（视口坐标 × dsf2）。
+- **selector 通过**（干净的 tab 上）：`#sec2 .badge` → 326x156 px（163x78 × dsf2，滚动条占用后布局宽度）。
+- `emulate reset` 回读 1662x1355 @1x；`closeTab` 报 `emulation restored`。
+- `networkIdle` 在已空闲页 0ms 返回（慢请求跟踪/放弃清理有单测覆盖）。
+- **新问题：并发命令会让其中一个挂死**。同一 tab 同时发 selector 截图 + clip 截图（agent 并行 tool
+  call），clip 成功、selector 永久挂住；单独重试 selector 正常。0.1.29 在 `background.js` 里把命令
+  串行化（一条 promise 队列），从协议层消除同 tab 并发 CDP 命令的互相踩踏。
+- 测试：新增 service worker 串行化断言；全套 **88 项全绿**。版本 0.1.29。
+
