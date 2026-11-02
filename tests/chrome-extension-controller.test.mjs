@@ -8,6 +8,15 @@ function makeChromeMock() {
     debuggerListeners: [],
     detachListeners: [],
     tabRemovedListeners: [],
+    windowCreatedListeners: [],
+    windowRemovedListeners: [],
+    /** Open tab groups: [{id, title, color, windowId, collapsed}]. */
+    groups: [],
+    /** tabId -> groupId as Chrome would report from `tabs.get`. */
+    tabGroupByTab: {},
+    nextGroupId: 42,
+    windowId: 1,
+    windows: [{ id: 1, type: "normal", focused: true }],
     evaluateResults: {
       snapshot: {
         title: "Example Domain",
@@ -28,37 +37,93 @@ function makeChromeMock() {
           state.tabRemovedListeners.push(listener);
         },
       },
-      async query() {
-        calls.push({ method: "tabs.query" });
+      async query(queryInfo = {}) {
+        calls.push({ method: "tabs.query", queryInfo });
+        if (queryInfo?.groupId !== undefined) {
+          const inGroup = Object.entries(state.tabGroupByTab)
+            .filter(([, groupId]) => groupId === queryInfo.groupId)
+            .map(([id]) => ({ id: Number(id), windowId: state.windowId, groupId: queryInfo.groupId }));
+          return inGroup;
+        }
         return [
-          { id: 1, title: "Example Domain", url: "https://example.com/", active: true },
-          { id: 2, title: "Docs", url: "https://example.org/docs", active: false },
+          { id: 1, title: "Example Domain", url: "https://example.com/", active: true, windowId: state.windowId, groupId: state.tabGroupByTab[1] ?? -1 },
+          { id: 2, title: "Docs", url: "https://example.org/docs", active: false, windowId: state.windowId, groupId: state.tabGroupByTab[2] ?? -1 },
         ];
       },
       async create(properties) {
         calls.push({ method: "tabs.create", properties });
-        return { id: 42, ...properties };
+        const id = state.nextTabId ?? 42;
+        state.tabGroupByTab[id] = -1;
+        return { id, windowId: state.windowId, ...properties };
       },
       async remove(tabId) {
         calls.push({ method: "tabs.remove", tabId });
+        delete state.tabGroupByTab[tabId];
       },
       async group(options) {
         calls.push({ method: "tabs.group", options });
-        return options.groupId ?? 42;
+        const tabIds = Array.isArray(options?.tabIds) ? options.tabIds : [options?.tabIds];
+        let groupId = options?.groupId;
+        if (groupId === undefined) {
+          groupId = state.nextGroupId ?? 42;
+          state.nextGroupId = groupId + 1;
+          state.groups.push({ id: groupId, windowId: state.windowId, title: "", color: "grey", collapsed: false });
+        } else if (!state.groups.some((group) => group.id === groupId)) {
+          throw new Error(`No group with id: ${groupId}`);
+        }
+        for (const tabId of tabIds) state.tabGroupByTab[tabId] = groupId;
+        return groupId;
       },
       async get(tabId) {
         calls.push({ method: "tabs.get", tabId });
-        const groupId = state.tabGroupOverrides?.[tabId] ?? 42;
-        return { id: tabId, groupId };
+        const groupId = state.tabGroupOverrides?.[tabId] ?? state.tabGroupByTab[tabId] ?? 42;
+        return { id: tabId, windowId: state.windowId, groupId };
       },
     },
     tabGroups: {
-      async query(queryInfo) {
+      async query(queryInfo = {}) {
         calls.push({ method: "tabGroups.query", queryInfo });
-        return state.groups ?? [];
+        let groups = state.groups ?? [];
+        if (queryInfo?.title !== undefined) {
+          const pattern = String(queryInfo.title).toLowerCase();
+          groups = groups.filter((group) => String(group.title ?? "").toLowerCase().includes(pattern));
+        }
+        if (queryInfo?.windowId !== undefined) groups = groups.filter((group) => group.windowId === queryInfo.windowId);
+        return groups.map((group) => ({ ...group }));
+      },
+      async get(groupId) {
+        calls.push({ method: "tabGroups.get", groupId });
+        const group = (state.groups ?? []).find((entry) => entry.id === groupId);
+        if (group === undefined) throw new Error(`No group with id: ${groupId}`);
+        return { ...group };
       },
       async update(groupId, properties) {
         calls.push({ method: "tabGroups.update", groupId, properties });
+        const group = (state.groups ?? []).find((entry) => entry.id === groupId);
+        if (group !== undefined) Object.assign(group, properties);
+        return group;
+      },
+    },
+    windows: {
+      onCreated: {
+        addListener(listener) {
+          state.windowCreatedListeners.push(listener);
+        },
+      },
+      onRemoved: {
+        addListener(listener) {
+          state.windowRemovedListeners.push(listener);
+        },
+      },
+      async getAll() {
+        calls.push({ method: "windows.getAll" });
+        return (state.windows ?? []).map((window) => ({ ...window }));
+      },
+      async get(windowId) {
+        calls.push({ method: "windows.get", windowId });
+        const window = (state.windows ?? []).find((entry) => entry.id === windowId);
+        if (window === undefined) throw new Error(`No window with id: ${windowId}`);
+        return { ...window };
       },
     },
     debugger: {
@@ -265,12 +330,12 @@ test("execute maps new-tab / close-tab / screenshot", async () => {
   const created = await controller.execute({ type: "new-tab", url: "https://example.com/", active: true });
   assert.equal(created.ok, true);
   assert.equal(calls.find((call) => call.method === "tabs.create").properties.active, true);
-  const closed = await controller.execute({ type: "close-tab", tabId: 42 });
-  assert.equal(closed.ok, true);
-  const shot = await controller.execute({ type: "screenshot", tabId: 1 });
+  const shot = await controller.execute({ type: "screenshot", tabId: 42 });
   assert.equal(shot.ok, true);
   assert.equal(shot.data, "AAAA");
   assert.ok(calls.some((call) => call.cdp === "Page.captureScreenshot"));
+  const closed = await controller.execute({ type: "close-tab", tabId: 42 });
+  assert.equal(closed.ok, true);
 });
 
 test("attach enables focus emulation so background tabs accept input", async () => {
@@ -320,17 +385,144 @@ test("newTab puts the tab into the DSH Agent tab group", async () => {
 
 test("a second agent tab reuses the existing DSH Agent group", async () => {
   const { chromeApi, calls } = makeChromeMock();
-  chromeApi.tabGroups.query = async () => {
-    calls.push({ method: "tabGroups.query" });
-    return [{ id: 42, title: "DSH Agent" }];
-  };
   const controller = createChromeController(chromeApi);
-  await controller.newTab("https://example.com/a");
-  await controller.newTab("https://example.com/b");
+  const first = await controller.newTab("https://example.com/a");
+  const second = await controller.newTab("https://example.com/b");
+  assert.equal(first.groupAction, "created");
+  assert.equal(second.groupAction, "reused");
   const groupCalls = calls.filter((call) => call.method === "tabs.group");
   assert.equal(groupCalls.length, 2);
   assert.equal(groupCalls[1].options.groupId, 42, "later agent tabs join the existing group");
-  assert.equal(calls.filter((call) => call.method === "tabGroups.query").length, 1, "the group is looked up once");
+  assert.ok(calls.filter((call) => call.method === "tabGroups.query").length >= 2, "every mutating path re-reads live groups");
+});
+
+test("a dead cached group id re-queries and reuses another open DSH Agent group instead of creating a duplicate", async () => {
+  const { chromeApi, state, calls } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.newTab("https://example.com/a"); // creates group 42
+  // Simulate: the group the controller cached is gone, but another window still
+  // has an open DSH Agent group (e.g. Chrome restored a saved group there).
+  state.groups = [{ id: 77, title: "DSH Agent", color: "orange", windowId: 1, collapsed: false }];
+  state.tabGroupByTab = {};
+  const second = await controller.newTab("https://example.com/b");
+  assert.equal(second.ok, true);
+  assert.equal(second.groupAction, "reused");
+  assert.equal(second.groupId, 77, "the open group is adopted, not duplicated");
+  const groupCalls = calls.filter((call) => call.method === "tabs.group");
+  assert.equal(groupCalls.at(-1).options.groupId, 77);
+  assert.equal(state.groups.length, 1, "no second DSH Agent group was created");
+});
+
+test("a new group after the previous window closed reports the saved-group hazard", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.newTab("https://example.com/a"); // creates group 42 in window 1
+  // Window 1 closes: its group is gone from `tabGroups.query` (Chrome keeps it
+  // as a saved tab group) and `windows.get(1)` now fails.
+  state.groups = [];
+  state.tabGroupByTab = {};
+  state.windows = [{ id: 2, type: "normal", focused: true }];
+  state.windowId = 2;
+  const second = await controller.newTab("https://example.com/b");
+  assert.equal(second.ok, true);
+  assert.equal(second.groupAction, "created");
+  assert.equal(second.savedGroupPossible, true);
+  assert.match(String(second.warning), /saved tab group/);
+  assert.equal(state.groups.length, 1, "exactly one new open group");
+});
+
+test("two open DSH Agent groups in one window are merged into the primary", async () => {
+  const { chromeApi, state, calls } = makeChromeMock();
+  state.groups = [
+    { id: 42, title: "DSH Agent", color: "orange", windowId: 1, collapsed: false },
+    { id: 55, title: "DSH Agent", color: "orange", windowId: 1, collapsed: false },
+  ];
+  state.tabGroupByTab = { 42: 42, 9: 55 };
+  const controller = createChromeController(chromeApi);
+  const result = await controller.newTab("https://example.com/a");
+  assert.equal(result.ok, true);
+  assert.equal(result.grouped, true);
+  assert.equal(result.groupsMerged, 1, "the duplicate group's tab was moved into the primary");
+  const mergeCall = calls.find((call) => call.method === "tabs.group" && Array.isArray(call.options.tabIds) && call.options.tabIds.includes(9));
+  assert.equal(mergeCall.options.groupId, 42);
+});
+
+test("ACL accepts tabs in any open DSH Agent group, not only the cached one", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  state.groups = [
+    { id: 42, title: "DSH Agent", color: "orange", windowId: 1, collapsed: false },
+    { id: 55, title: "DSH Agent", color: "orange", windowId: 1, collapsed: false },
+  ];
+  state.tabGroupOverrides = { 3: 55 };
+  const controller = createChromeController(chromeApi);
+  const snapshot = await controller.snapshot(3);
+  assert.equal(snapshot.ok, true, "a tab visibly inside DSH Agent must not be rejected because of a stale cache");
+});
+
+test("ACL allows tabs again once the agent group is gone (window closed)", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  state.groups = [];
+  state.tabGroupOverrides = { 9: -1 };
+  const controller = createChromeController(chromeApi);
+  const snapshot = await controller.snapshot(9);
+  assert.equal(snapshot.ok, true, "no open agent group means the ACL has nothing to guard");
+});
+
+test("state snapshot reports windows, tabs and open agent groups", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.newTab("https://example.com/"); // creates the DSH Agent group
+  state.tabGroupByTab = { 1: 42, 2: 42 };
+  const snapshot = await controller.snapshotState();
+  assert.equal(snapshot.normalWindows, 1);
+  assert.equal(snapshot.windows[0].id, 1);
+  assert.equal(snapshot.tabs, 2);
+  assert.equal(snapshot.agentGroups.length, 1);
+  assert.equal(snapshot.agentGroups[0].tabCount, 2);
+  assert.equal(snapshot.agentGroupId, 42);
+  assert.equal(snapshot.savedGroupPossible, false);
+  const viaCommand = await controller.execute({ type: "state" });
+  assert.equal(viaCommand.ok, true);
+  assert.equal(viaCommand.normalWindows, 1);
+});
+
+test("state snapshot reports a windowless background Chrome", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  state.windows = [];
+  state.groups = [];
+  state.tabGroupByTab = {};
+  const controller = createChromeController(chromeApi);
+  const snapshot = await controller.snapshotState();
+  assert.equal(snapshot.normalWindows, 0);
+  assert.equal(snapshot.tabs, 0);
+  assert.deepEqual(snapshot.agentGroups, []);
+  assert.equal(snapshot.savedGroupPossible, false);
+});
+
+test("state snapshot predicts the saved-group hazard after the owning window closes", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.newTab("https://example.com/a"); // group 42 in window 1
+  state.windows = [{ id: 2, type: "normal", focused: true }];
+  state.windowId = 2;
+  state.groups = [];
+  state.tabGroupByTab = {};
+  const snapshot = await controller.snapshotState();
+  assert.equal(snapshot.normalWindows, 1);
+  assert.deepEqual(snapshot.agentGroups, []);
+  assert.equal(snapshot.savedGroupPossible, true, "a vanished group in a vanished window means Chrome saved it");
+});
+
+test("window events invalidate the group cache and push a state snapshot", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const pushed = [];
+  const controller = createChromeController(chromeApi, { onStateChange: (snapshot) => pushed.push(snapshot) });
+  assert.equal(state.windowRemovedListeners.length, 1);
+  state.windowRemovedListeners[0](1);
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  assert.ok(pushed.length >= 1, "a window close must push fresh state to the Host");
+  assert.equal(pushed.at(-1).normalWindows, 1);
+  controller.snapshotState; // keep the controller referenced (no-op)
 });
 
 test("attach moves the controlled tab into the agent group", async () => {

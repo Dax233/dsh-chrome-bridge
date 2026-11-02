@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { createExtensionBridge } from "./ws.js";
+import { createExtensionBridge, sanitizeState } from "./ws.js";
 
 export const name = "chrome-extension-bridge";
 export const inject = ["tools"];
@@ -56,11 +56,66 @@ function connectHint() {
   );
 }
 
+/** Shown when the extension is attached but Chrome has no browser window left:
+ * "connected" alone reads as usable, which is what the 0.1.31 bug report was. */
+const NO_WINDOW_HINT =
+  "the chrome extension is connected, but Chrome has no open browser window, so there are no tabs to list or drive. " +
+  "action=newTab will make Chrome create a window. If the previous DSH Agent group disappeared with its window, Chrome may " +
+  "have kept it as a saved tab group in the bookmark bar: reopen it there (or expect one extra saved group) when relevant.";
+
+/** Chrome saves a tab group when its window closes; agentGroups then no longer lists it. */
+const SAVED_GROUP_NOTE =
+  "Chrome may have saved the DSH Agent group when its window closed instead of deleting it, so it can reappear as a saved " +
+  "tab group in the bookmark bar; agentGroups lists only currently-open groups.";
+
+/** Group-lifecycle diagnostics the extension may attach to newTab/attach results. */
+function groupWarnings(value) {
+  const parts = [];
+  const explicitWarning = typeof value?.warning === "string" && value.warning.trim() !== "";
+  if (explicitWarning) parts.push(`[warning: ${value.warning.trim()}]`);
+  if (!explicitWarning && value?.groupAction === "created" && value?.savedGroupPossible === true) {
+    parts.push("[the previous DSH Agent group may have been saved by Chrome; check the bookmark bar]");
+  }
+  if (Number.isFinite(Number(value?.groupsMerged)) && Number(value.groupsMerged) > 0) {
+    parts.push(`[merged ${Number(value.groupsMerged)} duplicate group(s)]`);
+  }
+  return parts.length === 0 ? "" : ` ${parts.join(" ")}`;
+}
+
+/**
+ * Build the `status` payload: host view plus the best known extension snapshot.
+ * Pure so tests can assert the JSON without a live extension; the connection
+ * hint text is passed in because it depends on this plugin's filesystem.
+ */
+function statusReport(status, state, connectHintText = "") {
+  const report = { ...status };
+  const extension = status.extension;
+  if (extension === null) {
+    report.usableWindows = null;
+    if (connectHintText !== "") report.hint = connectHintText;
+    return report;
+  }
+  // The bridge may only have the stale heartbeat snapshot; a live one wins.
+  const snapshot = state ?? extension.state ?? null;
+  report.extension = { ...extension, state: snapshot };
+  report.usableWindows = snapshot === null ? null : (snapshot.normalWindows ?? null);
+  if (report.usableWindows === 0) report.hint = NO_WINDOW_HINT;
+  if (snapshot?.savedGroupPossible === true) report.note = SAVED_GROUP_NOTE;
+  return report;
+}
+
+/** Zero tabs is not "no visible tabs" when Chrome has no window to show them in. */
+function noWindowTabsText(state) {
+  const saved = state?.savedGroupPossible === true ? " Chrome may have saved the previous DSH Agent group; check the bookmark bar." : "";
+  return `no tabs: the chrome extension is connected, but Chrome has no open browser window. action=newTab will make Chrome create a window.${saved}`;
+}
+
 const DESCRIPTION =
   "Control the user's real Chrome through the companion extension (chrome.debugger). " +
   "Only tabs inside the DSH Agent group can be driven: newTab groups automatically, and attach moves an existing tab into the group (the explicit opt-in). " +
     "Use action=tabs to list tabs; prefer action=newTab {url} to open a fresh tab in the background, then " +
   "action=attach with its tabId before other tab actions. " +
+  "action=status also reports whether Chrome has a usable window and the DSH Agent tab-group state. " +
   "Actions: newTab {url, active?}, closeTab {tabId}, navigate {tabId,url}, snapshot {tabId}, click {tabId,ref|x,y}, " +
   "type {tabId,text,ref?}, key {tabId,key}, scroll {tabId,deltaY}, screenshot {tabId,format?,quality?,fullPage?,clip?,ref?,selector?}, " +
   "emulate {tabId,width?,height?,deviceScaleFactor?,mobile?,colorScheme?,reset?}, logs {tabId,limit?,filter?,clear?}, upload {tabId,ref,paths}, " +
@@ -433,11 +488,11 @@ function formatResult(action, value) {
     case "newTab":
       return `created tab ${value.tabId}${value.url ? ` (${value.url})` : ""}${value.active ? " in the foreground" : " in the background"}${
         value.grouped ? " [tab group: DSH Agent]" : ""
-      }`;
+      }${groupWarnings(value)}`;
     case "closeTab":
       return `closed tab ${value.tabId}${value.emulationReset ? " (emulation restored)" : ""}`;
     case "attach":
-      return `attached to tab ${value.tabId}${value.grouped ? " [tab group: DSH Agent]" : ""}${value.groupingError ? ` [grouping failed: ${String(value.groupingError)}]` : ""}`;
+      return `attached to tab ${value.tabId}${value.grouped ? " [tab group: DSH Agent]" : ""}${value.groupingError ? ` [grouping failed: ${String(value.groupingError)}]` : ""}${groupWarnings(value)}`;
     case "detach":
       return `detached from tab ${value.tabId}${value.emulationReset ? " (emulation restored)" : ""}`;
     case "navigate":
@@ -589,6 +644,22 @@ export function apply(ctx) {
       return await bridge.sendCommand(command);
     }
   }
+
+  /** Live browser snapshot from the extension; diagnostics only, never fails the tool. */
+  async function extensionState(timeoutMs = 1500) {
+    if (bridge.status().extension === null) return null;
+    try {
+      const outcome = await bridge.sendCommand({ type: "state" }, timeoutMs);
+      const value = outcome?.value;
+      if (value === null || typeof value !== "object" || value.ok !== true) return null;
+      // The contract inlines the snapshot; tolerate a nested `state` too.
+      const raw = value.state !== null && typeof value.state === "object" && !Array.isArray(value.state) ? value.state : value;
+      return sanitizeState(raw);
+    } catch {
+      // Older extensions may not know the state command; status still works.
+      return null;
+    }
+  }
   ctx.effect(
     () =>
       ctx.tools.register({
@@ -676,10 +747,8 @@ export function apply(ctx) {
           }
           if (action === "status") {
             const status = bridge.status();
-            const text = status.extension === null
-              ? JSON.stringify({ ...status, hint: connectHint() }, null, 2)
-              : JSON.stringify(status, null, 2);
-            return { text };
+            const state = status.extension === null ? null : await extensionState();
+            return { text: JSON.stringify(statusReport(status, state, connectHint()), null, 2) };
           }
           const command = toCommand(action, args);
           if (!(await waitForExtension(2500))) {
@@ -689,6 +758,11 @@ export function apply(ctx) {
           const value = outcome.value;
           if (value === undefined || value === null || value.ok !== true) {
             return { text: `chrome ${action} failed: ${String(value?.error ?? "no result from the extension")}` };
+          }
+          if (action === "tabs" && (Array.isArray(value.tabs) ? value.tabs.length : 0) === 0) {
+            // "no visible tabs" is misleading when Chrome has no window at all.
+            const state = await extensionState();
+            if (state?.normalWindows === 0) return { text: noWindowTabsText(state) };
           }
           if (action === "screenshot") {
             const saved = saveScreenshot(value.data, value.format ?? command.format ?? "png");
@@ -710,4 +784,4 @@ export function apply(ctx) {
 }
 
 /** Host-side formatting/dispatch helpers exposed for tests. */
-export const __test = { toCommand, formatResult, formatSnapshot, saveScreenshot, imageSize };
+export const __test = { toCommand, formatResult, formatSnapshot, saveScreenshot, imageSize, statusReport, noWindowTabsText };

@@ -11,12 +11,22 @@ import { createChromeController } from "./controller.js";
 const DEFAULT_PORT = 47835;
 const DEFAULT_TOKEN = "dsh-chrome-bridge-local";
 
-const controller = createChromeController(chrome);
-
 let socket = null;
 let reconnectTimer = null;
 let attempt = 0;
 let stopped = false;
+
+const controller = createChromeController(chrome, {
+  // Window/tab-group changes invalidate the Host's picture of the browser, so
+  // push it proactively instead of waiting for the next heartbeat.
+  onStateChange: (state) => {
+    try {
+      socket?.send(JSON.stringify({ type: "state", at: Date.now(), state }));
+    } catch {
+      // The close handler reconnects.
+    }
+  },
+});
 
 async function getConfig() {
   const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: DEFAULT_TOKEN });
@@ -49,7 +59,7 @@ async function connect() {
     attempt = 0;
     try {
       // The token is a handshake field, not a URL query: URLs leak into logs.
-      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.30", token }));
+      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.31", token }));
     } catch {
       // The close handler will reconnect.
     }
@@ -70,9 +80,17 @@ async function connect() {
       if (message === null || typeof message !== "object") return;
       if (message.type === "ping") {
         // Answer the Host heartbeat: this JS message activity keeps the MV3
-        // service worker alive between agent commands.
+        // service worker alive between agent commands. The reply also carries a
+        // browser-state snapshot so `chrome status` can tell "connected" from
+        // "connected but there is no open Chrome window".
+        let state;
         try {
-          ws.send(JSON.stringify({ type: "pong", at: Date.now() }));
+          state = await controller.snapshotState();
+        } catch {
+          state = undefined;
+        }
+        try {
+          ws.send(JSON.stringify(state === undefined ? { type: "pong", at: Date.now() } : { type: "pong", at: Date.now(), state }));
         } catch {
           // The close handler reconnects.
         }

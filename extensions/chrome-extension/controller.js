@@ -320,7 +320,28 @@ export function createChromeController(chromeApi, options = {}) {
   /** tabId -> bounded console/network entries captured from CDP events. */
   const logBuffers = new Map();
   let eventsWired = false;
+  /**
+   * The group the bridge is currently using, plus a short-lived cache of every
+   * open group titled `AGENT_GROUP_TITLE`. The cache exists because the ACL
+   * check runs on every action, but it is only a hint: `tabs.get` remains the
+   * source of truth and every mutating path re-queries Chrome.
+   */
   let agentGroupId;
+  /** Window that holds `agentGroupId`; lets a window close invalidate the cache. */
+  let agentGroupWindowId;
+  /** ids of open groups titled `AGENT_GROUP_TITLE` (or `agentGroupId`) as last seen. */
+  let agentGroupIds = new Set();
+  let agentGroupsCheckedAt = 0;
+  /**
+   * Chrome keeps titled groups as "saved tab groups" when the window that owns
+   * them closes; `chrome.tabGroups.query` cannot see those saved (closed)
+   * groups, so the bridge cannot reuse them. Tracked only to warn the caller
+   * that a new group may leave a duplicate behind in Chrome's saved-groups bar.
+   */
+  let savedGroupPossible = false;
+  let lastWindowCloseAt;
+  const stateListeners = typeof options?.onStateChange === "function" ? options.onStateChange : undefined;
+  let statePushTimer;
 
   function bufferFor(tabId) {
     let buffer = logBuffers.get(tabId);
@@ -446,6 +467,10 @@ export function createChromeController(chromeApi, options = {}) {
    * session Chrome ends itself, e.g. the user dismisses the infobar) must not
    * leave stale refs/emulation records behind. CDP overrides die with the
    * session, so removal here only needs to drop bookkeeping.
+   *
+   * Tab-group events only invalidate the group-id cache; the authoritative
+   * read happens in `refreshAgentGroups` / `allAgentGroups`. That keeps the
+   * cache statistically fresh without trusting it for an action.
    */
   function wireTabEvents() {
     const onRemoved = chromeApi.tabs?.onRemoved;
@@ -461,40 +486,173 @@ export function createChromeController(chromeApi, options = {}) {
         if (typeof tabId === "number") releaseTabState(tabId);
       });
     }
+    for (const event of [chromeApi.tabGroups?.onCreated, chromeApi.tabGroups?.onUpdated, chromeApi.tabGroups?.onRemoved]) {
+      if (typeof event?.addListener !== "function") continue;
+      event.addListener(() => {
+        invalidateAgentGroups();
+        pushStateSoon();
+      });
+    }
+    for (const event of [chromeApi.windows?.onCreated, chromeApi.windows?.onRemoved]) {
+      if (typeof event?.addListener !== "function") continue;
+      event.addListener(() => {
+        invalidateAgentGroups();
+        pushStateSoon();
+      });
+    }
+  }
+
+  function invalidateAgentGroups() {
+    agentGroupIds = new Set();
+    agentGroupsCheckedAt = 0;
+  }
+
+  /** Push (throttled) a state snapshot to the Host so its `status` is not blind to window closes. */
+  function pushStateSoon() {
+    if (stateListeners === undefined || statePushTimer !== undefined) return;
+    statePushTimer = setTimeout(() => {
+      statePushTimer = undefined;
+      void (async () => {
+        try {
+          const state = await snapshotState();
+          stateListeners(state);
+        } catch {
+          // Diagnostics only; never break the command path.
+        }
+      })();
+    }, 200);
+    statePushTimer.unref?.();
+  }
+
+  async function normalWindows() {
+    if (typeof chromeApi.windows?.getAll !== "function") return [];
+    try {
+      const windows = await chromeApi.windows.getAll({ windowTypes: ["normal"] });
+      return Array.isArray(windows) ? windows : [];
+    } catch {
+      try {
+        const windows = await chromeApi.windows.getAll({});
+        return Array.isArray(windows) ? windows.filter((window) => window?.type === undefined || window.type === "normal") : [];
+      } catch {
+        return [];
+      }
+    }
   }
 
   /**
-   * Put one tab into the "DSH Agent" tab group so the user can tell agent work
-   * apart from their own tabs. Failures are reported, never fatal: a tab group
-   * needs the tabGroups permission and older Chrome builds may lack the API.
+   * A snapshot for the Host `status` action. The Host previously could only see
+   * the WebSocket, so a background Chrome with no window looked "connected";
+   * `normalWindows` and `agentGroups` make that state visible.
    */
-  async function agentGroupIdNow() {
-    if (agentGroupId !== undefined) return agentGroupId;
+  async function snapshotState() {
+    const at = Date.now();
+    const windows = (await normalWindows()).filter((window) => window && typeof window.id === "number");
+    const windowIds = new Set(windows.map((window) => window.id));
+    let tabs = [];
     try {
-      const groups = await chromeApi.tabGroups.query({ title: AGENT_GROUP_TITLE });
-      if (Array.isArray(groups) && groups.length > 0) agentGroupId = groups[0].id;
+      const all = await chromeApi.tabs.query({});
+      tabs = Array.isArray(all) ? all : [];
     } catch {
-      agentGroupId = undefined;
+      tabs = [];
     }
-    return agentGroupId;
+    let groups = [];
+    if (typeof chromeApi.tabGroups?.query === "function") {
+      try {
+        const all = await chromeApi.tabGroups.query({});
+        groups = Array.isArray(all) ? all : [];
+      } catch {
+        groups = [];
+      }
+    }
+    const agentGroups = groups
+      .filter((group) => group && typeof group.id === "number" && (String(group.title ?? "") === AGENT_GROUP_TITLE || group.id === agentGroupId))
+      .map((group) => ({
+        id: group.id,
+        windowId: typeof group.windowId === "number" ? group.windowId : null,
+        title: String(group.title ?? ""),
+        tabCount: tabs.filter((tab) => tab?.groupId === group.id).length,
+        collapsed: group.collapsed === true,
+      }));
+    // Predict the saved-group hazard without mutating state: a cached group that
+    // is no longer open, in a window that is also gone, was saved by Chrome.
+    const savedGroupPredicted =
+      agentGroupId !== undefined &&
+      agentGroupWindowId !== undefined &&
+      !groups.some((group) => group?.id === agentGroupId) &&
+      !windowIds.has(agentGroupWindowId);
+    return {
+      at,
+      normalWindows: windows.length,
+      windows: windows.map((window) => ({
+        id: window.id,
+        focused: window.focused === true,
+        tabCount: tabs.filter((tab) => tab?.windowId === window.id).length,
+      })),
+      tabs: tabs.filter((tab) => windowIds.has(tab?.windowId)).length,
+      agentGroups,
+      agentGroupId: typeof agentGroupId === "number" ? agentGroupId : null,
+      savedGroupPossible: savedGroupPossible || savedGroupPredicted,
+      lastWindowCloseAt: lastWindowCloseAt ?? null,
+    };
+  }
+
+  /** All open groups the bridge considers its own: exact title, or the cached id. */
+  async function allAgentGroups() {
+    if (typeof chromeApi.tabGroups?.query !== "function") return [];
+    try {
+      const groups = await chromeApi.tabGroups.query({});
+      return (Array.isArray(groups) ? groups : []).filter(
+        (group) => group && typeof group.id === "number" && (String(group.title ?? "") === AGENT_GROUP_TITLE || group.id === agentGroupId),
+      );
+    } catch {
+      return [];
+    }
   }
 
   /**
    * ACL: once a DSH Agent group exists, only tabs inside it may be driven.
    * attach() is the explicit opt-in (it moves the tab into the group); before
-   * any agent tab exists there is nothing to guard.
+   * any agent tab exists there is nothing to guard. Membership is resolved from
+   * live `tabGroups.query`, not the cached id: after a window close the cached
+   * id is dead, and a wrongly trusted id rejected every tab in the new window.
    */
+  async function refreshAgentGroups(force = false) {
+    if (!force && Date.now() - agentGroupsCheckedAt < 1500) return;
+    agentGroupsCheckedAt = Date.now();
+    if (typeof chromeApi.tabGroups?.query !== "function") {
+      agentGroupIds = new Set();
+      return;
+    }
+    try {
+      const groups = await chromeApi.tabGroups.query({});
+      const ids = new Set();
+      for (const group of Array.isArray(groups) ? groups : []) {
+        if (!group || typeof group.id !== "number") continue;
+        if (String(group.title ?? "") === AGENT_GROUP_TITLE || group.id === agentGroupId) ids.add(group.id);
+      }
+      agentGroupIds = ids;
+    } catch {
+      // Keep the previous cache rather than turning the ACL off on a transient error.
+    }
+  }
+
   async function assertAgentTab(tabId) {
-    const group = await agentGroupIdNow();
-    if (group === undefined) return;
+    await refreshAgentGroups();
+    if (agentGroupIds.size === 0) return;
     let tab;
     try {
       tab = await chromeApi.tabs.get(tabId);
     } catch {
       throw new Error(`tab ${tabId} not found`);
     }
-    if (tab?.groupId === group) return;
-    if (await waitForGroupMembership(tabId, group, 600)) return;
+    if (agentGroupIds.has(tab?.groupId)) return;
+    // A tab-group event can be missed around a service-worker restart.
+    await refreshAgentGroups(true);
+    if (agentGroupIds.size === 0) return;
+    if (agentGroupIds.has(await tabGroupOf(tabId))) return;
+    for (const groupId of agentGroupIds) {
+      if (await waitForGroupMembership(tabId, groupId, 250)) return;
+    }
     throw new Error(`tab ${tabId} is not in the DSH Agent group; call attach first to opt it in`);
   }
 
@@ -516,23 +674,104 @@ export function createChromeController(chromeApi, options = {}) {
     }
   }
 
+  /**
+   * Chrome persists a titled group as a "saved tab group" when its window
+   * closes. `chrome.tabGroups.query` cannot see saved (closed) groups, and no
+   * extension API can reopen one, so the bridge cannot reuse it. This records
+   * that situation so the caller gets a warning instead of a silent duplicate.
+   */
+  async function noteGroupVanished() {
+    const windowId = agentGroupWindowId;
+    agentGroupId = undefined;
+    agentGroupWindowId = undefined;
+    if (typeof windowId === "number" && typeof chromeApi.windows?.get === "function") {
+      try {
+        await chromeApi.windows.get(windowId);
+        return false; // Window still open: the group was emptied, nothing was saved.
+      } catch {
+        // Window is gone, so Chrome kept the group as a saved tab group.
+      }
+    }
+    savedGroupPossible = true;
+    lastWindowCloseAt = new Date().toISOString();
+    return true;
+  }
+
+  function chooseAgentGroup(candidates, windowId) {
+    if (candidates.length === 0) return undefined;
+    const cached = agentGroupId === undefined ? undefined : candidates.find((group) => group.id === agentGroupId);
+    if (windowId !== undefined) {
+      const sameWindow = candidates.find((group) => group.windowId === windowId);
+      if (sameWindow !== undefined && (cached === undefined || cached.windowId !== windowId)) return sameWindow;
+    }
+    if (cached !== undefined) return cached;
+    return candidates[0];
+  }
+
+  /**
+   * Older builds could leave several open "DSH Agent" groups behind (e.g. the
+   * user reopens a saved group in the same window). Merge same-window
+   * duplicates into the primary group; `tabs.group` deletes groups it empties.
+   */
+  async function mergeAgentGroups(primary, candidates) {
+    let merged = 0;
+    for (const group of candidates) {
+      if (group.id === primary.id) continue;
+      if (typeof group.windowId === "number" && typeof primary.windowId === "number" && group.windowId !== primary.windowId) continue;
+      let tabs = [];
+      try {
+        tabs = await chromeApi.tabs.query({ groupId: group.id });
+      } catch {
+        continue;
+      }
+      const tabIds = (Array.isArray(tabs) ? tabs : []).map((tab) => tab?.id).filter((id) => typeof id === "number");
+      if (tabIds.length === 0) continue;
+      try {
+        await chromeApi.tabs.group({ tabIds, groupId: primary.id });
+        merged += 1;
+      } catch {
+        // Merging is best-effort; grouping the new tab below still proceeds.
+      }
+    }
+    return merged;
+  }
+
+  /** Put one tab into the "DSH Agent" tab group so the user can tell agent work apart from their own tabs. */
   async function ensureAgentGroup(tabId) {
     try {
-      if (agentGroupId === undefined && typeof chromeApi.tabGroups?.query === "function") {
-        const existing = await chromeApi.tabGroups.query({ title: AGENT_GROUP_TITLE });
-        if (Array.isArray(existing) && existing.length > 0) agentGroupId = existing[0].id;
-      }
+      const candidates = await allAgentGroups();
+      const target = await chromeApi.tabs.get(tabId).catch(() => undefined);
+      const targetWindowId = typeof target?.windowId === "number" ? target.windowId : undefined;
+      const groupVanished = agentGroupId !== undefined && !candidates.some((group) => group.id === agentGroupId);
+      const savedNotice = groupVanished ? await noteGroupVanished() : false;
+      const primary = chooseAgentGroup(candidates, targetWindowId);
+      const groupsMerged = primary === undefined ? 0 : await mergeAgentGroups(primary, candidates);
       let groupId;
-      try {
-        const options = { tabIds: [tabId] };
-        if (agentGroupId !== undefined) options.groupId = agentGroupId;
-        groupId = await chromeApi.tabs.group(options);
-      } catch (error) {
-        // A cached group id can outlive the actual group after Chrome restarts.
-        agentGroupId = undefined;
+      let groupAction = "reused";
+      if (primary !== undefined) {
+        try {
+          groupId = await chromeApi.tabs.group({ tabIds: [tabId], groupId: primary.id });
+        } catch {
+          // The group can disappear between the query and `tabs.group`; re-read
+          // once before creating a new one (creating blindly is how duplicate
+          // "DSH Agent" groups used to appear).
+          agentGroupId = undefined;
+          agentGroupWindowId = undefined;
+          const retry = chooseAgentGroup(await allAgentGroups(), targetWindowId);
+          if (retry !== undefined) {
+            groupId = await chromeApi.tabs.group({ tabIds: [tabId], groupId: retry.id });
+          } else {
+            groupId = await chromeApi.tabs.group({ tabIds: [tabId] });
+            groupAction = "created";
+          }
+        }
+      } else {
         groupId = await chromeApi.tabs.group({ tabIds: [tabId] });
+        groupAction = "created";
       }
       agentGroupId = groupId;
+      const grouped = await chromeApi.tabs.get(tabId).catch(() => undefined);
+      if (typeof grouped?.windowId === "number") agentGroupWindowId = grouped.windowId;
       try {
         await chromeApi.tabGroups.update(groupId, {
           title: AGENT_GROUP_TITLE,
@@ -542,11 +781,20 @@ export function createChromeController(chromeApi, options = {}) {
       } catch {
         // A group without a title/colour still separates the tabs visually.
       }
+      invalidateAgentGroups();
+      await refreshAgentGroups(true);
+      pushStateSoon();
       const applied = await waitForGroupMembership(tabId, groupId);
-      if (!applied) {
-        return { grouped: false, groupId, groupingError: "Chrome did not apply the tab group membership" };
+      const result = { grouped: applied, groupId, groupAction, groupsMerged };
+      if (!applied) result.groupingError = "Chrome did not apply the tab group membership";
+      if (savedNotice) {
+        result.savedGroupPossible = true;
+        result.warning =
+          "Chrome saved the previous DSH Agent group as a saved tab group when its window closed; " +
+          "the tabGroups API cannot reopen saved groups, so this created a new one. " +
+          "Reopen the saved group from the bookmarks bar to restore its tabs, or close the extra saved entry.";
       }
-      return { grouped: true, groupId };
+      return result;
     } catch (error) {
       return { grouped: false, groupingError: String(error && error.message ? error.message : error) };
     }
@@ -1714,7 +1962,26 @@ export function createChromeController(chromeApi, options = {}) {
   async function newTab(url, options = {}) {
     const target = toHttpUrl(url);
     const active = options.active === true;
-    const tab = await chromeApi.tabs.create({ url: target, active });
+    let tab;
+    try {
+      tab = await chromeApi.tabs.create({ url: target, active });
+    } catch (error) {
+      // A background Chrome with no window rejects `tabs.create` on some
+      // builds; opening a window explicitly keeps the tool usable there.
+      if (typeof chromeApi.windows?.create !== "function") throw error;
+      const created = await chromeApi.windows.create({ url: target, focused: active });
+      let first = Array.isArray(created?.tabs) ? created.tabs[0] : undefined;
+      if (first === undefined && typeof created?.id === "number" && typeof chromeApi.tabs?.query === "function") {
+        try {
+          const createdTabs = await chromeApi.tabs.query({ windowId: created.id });
+          first = Array.isArray(createdTabs) ? createdTabs[0] : undefined;
+        } catch {
+          first = undefined;
+        }
+      }
+      tab = first;
+      if (typeof tab?.id !== "number") throw error;
+    }
     const grouping = await ensureAgentGroup(tab.id);
     return { ok: true, tabId: tab?.id, url: target, active, ...grouping };
   }
@@ -1735,6 +2002,8 @@ export function createChromeController(chromeApi, options = {}) {
   async function execute(command) {
     try {
       switch (command?.type) {
+        case "state":
+          return { ok: true, ...(await snapshotState()) };
         case "list-tabs":
           return await listTabs();
         case "new-tab":
@@ -1797,6 +2066,7 @@ export function createChromeController(chromeApi, options = {}) {
     emulate,
     newTab,
     closeTab,
+    snapshotState,
     execute,
   };
 }

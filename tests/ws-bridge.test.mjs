@@ -1,13 +1,24 @@
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createExtensionBridge } from "../ws.js";
+import { createExtensionBridge, sanitizeState } from "../ws.js";
 
 const TOKEN = "ws-test-token";
 const tempState = () => join(mkdtempSync(join(tmpdir(), "dsh-ws-test-")), "state.json");
+
+/** Poll a synchronous predicate; the bridge updates state from socket handlers. */
+async function waitFor(predicate, timeoutMs = 2000) {
+  const started = Date.now();
+  for (;;) {
+    const value = predicate();
+    if (value !== undefined && value !== false && value !== null) return value;
+    if (Date.now() - started >= timeoutMs) throw new Error("condition not met before timeout");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 function makeBridge(overrides = {}) {
   return createExtensionBridge({
@@ -266,4 +277,136 @@ test("extension bridge: heartbeat pings and drops a stale extension", async () =
   } finally {
     bridge.close();
   }
+});
+
+function snapshot(overrides = {}) {
+  return {
+    at: Date.now(),
+    normalWindows: 1,
+    windows: [{ id: 5, focused: true, tabCount: 2 }],
+    tabs: 2,
+    agentGroups: [{ id: 9, windowId: 5, title: "DSH Agent", tabCount: 1, collapsed: false }],
+    agentGroupId: 9,
+    savedGroupPossible: false,
+    lastWindowCloseAt: null,
+    ...overrides,
+  };
+}
+
+test("extension bridge: a pong heartbeat stores the browser state snapshot", async () => {
+  const stateFile = tempState();
+  const bridge = makeBridge({ stateFile });
+  const port = await bridge.start();
+  try {
+    const socket = connect(port);
+    await waitOpen(socket);
+    await hello(socket);
+    const sent = snapshot();
+    socket.send(JSON.stringify({ type: "pong", at: sent.at, state: sent }));
+    const state = await waitFor(() => bridge.status().extension?.state);
+    assert.deepEqual(state, sent);
+    assert.equal(typeof bridge.status().extension.lastSeenAt, "string");
+    // Diagnostics on disk must carry the same snapshot, not only status().
+    const persisted = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert.deepEqual(persisted.extension.state, sent);
+    socket.close();
+  } finally {
+    bridge.close();
+  }
+});
+
+test("extension bridge: an unsolicited state push updates the snapshot", async () => {
+  const bridge = makeBridge();
+  const port = await bridge.start();
+  try {
+    const socket = connect(port);
+    await waitOpen(socket);
+    await hello(socket);
+    const opened = snapshot();
+    socket.send(JSON.stringify({ type: "state", at: opened.at, state: opened }));
+    await waitFor(() => bridge.status().extension?.state?.normalWindows === 1);
+
+    const closed = snapshot({
+      at: Date.now(),
+      normalWindows: 0,
+      windows: [],
+      tabs: 0,
+      agentGroups: [],
+      agentGroupId: null,
+      savedGroupPossible: true,
+      lastWindowCloseAt: new Date().toISOString(),
+    });
+    socket.send(JSON.stringify({ type: "state", at: closed.at, state: closed }));
+    const state = await waitFor(() => {
+      const current = bridge.status().extension?.state;
+      return current?.normalWindows === 0 ? current : null;
+    });
+    assert.equal(state.savedGroupPossible, true);
+    assert.deepEqual(state.agentGroups, []);
+    assert.equal(typeof state.lastWindowCloseAt, "string");
+    socket.close();
+  } finally {
+    bridge.close();
+  }
+});
+
+test("extension bridge: malformed state snapshots never throw and are sanitized", async () => {
+  const bridge = makeBridge();
+  const port = await bridge.start();
+  try {
+    const socket = connect(port);
+    await waitOpen(socket);
+    await hello(socket);
+    socket.send(JSON.stringify({ type: "state", state: snapshot() }));
+    await waitFor(() => bridge.status().extension?.state?.normalWindows === 1);
+
+    // A non-object snapshot drops back to null instead of crashing.
+    socket.send(JSON.stringify({ type: "state", state: "nope" }));
+    await waitFor(() => bridge.status().extension?.state === null);
+
+    // Junk fields and array entries are coerced; unknown fields are dropped.
+    socket.send(
+      JSON.stringify({
+        type: "state",
+        state: {
+          at: "later",
+          normalWindows: "many",
+          windows: [null, 3, { id: "7", focused: 1, tabCount: "2" }],
+          tabs: -4,
+          agentGroups: [undefined, { id: 9, windowId: 5, title: 42, tabCount: -1, collapsed: 1 }],
+          agentGroupId: "9",
+          savedGroupPossible: "yes",
+          lastWindowCloseAt: 123,
+          extra: "dropped",
+        },
+      }),
+    );
+    const state = await waitFor(() => {
+      const current = bridge.status().extension?.state;
+      return current?.windows !== undefined ? current : null;
+    });
+    assert.equal(state.at, undefined);
+    assert.equal(state.normalWindows, undefined);
+    assert.deepEqual(state.windows, [{ id: 7, focused: false, tabCount: 2 }]);
+    assert.equal(state.tabs, undefined);
+    assert.deepEqual(state.agentGroups, [{ id: 9, windowId: 5, title: "", tabCount: 0, collapsed: false }]);
+    assert.equal(state.agentGroupId, null);
+    assert.equal(state.savedGroupPossible, false);
+    assert.equal(state.lastWindowCloseAt, null);
+    assert.equal(state.extra, undefined);
+
+    // A malformed pong must not take the connection down either.
+    socket.send(JSON.stringify({ type: "pong", state: ["junk"] }));
+    await waitFor(() => bridge.status().extension?.state === null);
+    socket.close();
+  } finally {
+    bridge.close();
+  }
+});
+
+test("sanitizeState: unit-level guards", () => {
+  assert.equal(sanitizeState(null), null);
+  assert.equal(sanitizeState("nope"), null);
+  assert.equal(sanitizeState([1, 2]), null);
+  assert.deepEqual(sanitizeState({}), { agentGroupId: null, savedGroupPossible: false, lastWindowCloseAt: null });
 });

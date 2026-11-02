@@ -8,9 +8,11 @@
  * active at a time; a new connection replaces the previous one.
  *
  * Protocol (JSON text frames):
- *   client → { type: "hello", name, version }      server → { type: "hello-ack", ... }
+ *   client → { type: "hello", name, version, token }  server → { type: "hello-ack", ... }
  *   server → { type: "command", id, cmd }          client → { type: "result", id, result }
  *                                                  client → { type: "error", id, message }
+ *   client → { type: "pong", at, state }           heartbeat reply carrying a browser snapshot
+ *   client → { type: "state", at, state }          unsolicited snapshot push (window opened/closed)
  */
 import { createServer } from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -39,6 +41,50 @@ function originAllowed(origin) {
 
 function acceptKey(key) {
   return createHash("sha1").update(key + WS_GUID).digest("base64");
+}
+
+const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
+
+/** Coerce a count-like field; junk collapses to 0 so a malformed snapshot can
+ * never leak NaN or strings into the status output. */
+function toCount(value) {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : 0;
+}
+
+/**
+ * Validate a browser-state snapshot reported by the extension.
+ *
+ * Keeps only known fields and coerces their types: a newer extension may add
+ * fields, a buggy one may send junk, but neither may crash the Host or poison
+ * `status` output. Returns null when the value is not an object at all.
+ */
+export function sanitizeState(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const state = {};
+  if (isFiniteNumber(raw.at)) state.at = raw.at;
+  if (isFiniteNumber(raw.normalWindows) && raw.normalWindows >= 0) state.normalWindows = Math.trunc(raw.normalWindows);
+  if (Array.isArray(raw.windows)) {
+    state.windows = raw.windows
+      .filter((window) => window !== null && typeof window === "object" && !Array.isArray(window))
+      .map((window) => ({ id: toCount(window.id), focused: window.focused === true, tabCount: toCount(window.tabCount) }));
+  }
+  if (isFiniteNumber(raw.tabs) && raw.tabs >= 0) state.tabs = Math.trunc(raw.tabs);
+  if (Array.isArray(raw.agentGroups)) {
+    state.agentGroups = raw.agentGroups
+      .filter((group) => group !== null && typeof group === "object" && !Array.isArray(group))
+      .map((group) => ({
+        id: toCount(group.id),
+        windowId: toCount(group.windowId),
+        title: typeof group.title === "string" ? group.title : "",
+        tabCount: toCount(group.tabCount),
+        collapsed: group.collapsed === true,
+      }));
+  }
+  state.agentGroupId = isFiniteNumber(raw.agentGroupId) ? raw.agentGroupId : null;
+  state.savedGroupPossible = raw.savedGroupPossible === true;
+  state.lastWindowCloseAt = typeof raw.lastWindowCloseAt === "string" ? raw.lastWindowCloseAt : null;
+  return state;
 }
 
 function encodeFrame(opcode, payload) {
@@ -123,12 +169,24 @@ export function createExtensionBridge(options) {
   let listeningPort;
   let heartbeat;
 
+  /** Extension view shared by status() and the persisted diagnostics file. */
+  function extensionStatus() {
+    if (client === undefined) return null;
+    return {
+      name: client.name,
+      version: client.version,
+      connectedAt: client.connectedAt,
+      lastSeenAt: new Date(client.lastSeen).toISOString(),
+      state: client.state ?? null,
+    };
+  }
+
   function writeState(extra = {}) {
     const state = {
       at: new Date().toISOString(),
       listening: server !== undefined,
       port: listeningPort,
-      extension: client === undefined ? null : { name: client.name, version: client.version, connectedAt: client.connectedAt },
+      extension: extensionStatus(),
       pending: pending.size,
       ...sticky,
       ...extra,
@@ -145,10 +203,7 @@ export function createExtensionBridge(options) {
     return {
       listening: server !== undefined,
       port: listeningPort,
-      extension:
-        client === undefined
-          ? null
-          : { name: client.name, version: client.version, connectedAt: client.connectedAt },
+      extension: extensionStatus(),
       pending: pending.size,
     };
   }
@@ -231,13 +286,32 @@ export function createExtensionBridge(options) {
           version: typeof message.version === "string" ? message.version : "unknown",
           connectedAt: new Date().toISOString(),
           lastSeen: Date.now(),
+          state: null,
+          stateAt: null,
         };
         send(socket, { type: "hello-ack", server: "dsh-chrome-bridge", version: 1 });
         writeState();
         return;
       }
       case "pong": {
-        if (client !== undefined && client.socket === socket) client.lastSeen = Date.now();
+        if (client !== undefined && client.socket === socket) {
+          client.lastSeen = Date.now();
+          if (message.state !== undefined) {
+            client.state = sanitizeState(message.state);
+            client.stateAt = client.lastSeen;
+            writeState();
+          }
+        }
+        return;
+      }
+      case "state": {
+        if (client !== undefined && client.socket === socket) {
+          // Any message proves the worker is alive, not only a heartbeat reply.
+          client.lastSeen = Date.now();
+          client.state = sanitizeState(message.state);
+          client.stateAt = client.lastSeen;
+          writeState();
+        }
         return;
       }
       case "result": {
@@ -262,10 +336,6 @@ export function createExtensionBridge(options) {
         clearTimeout(entry.timer);
         entry.reject(new Error(String(message.message ?? "extension error")));
         writeState({ lastError: message.id });
-        return;
-      }
-      case "pong": {
-        if (client !== undefined) client.lastSeen = Date.now();
         return;
       }
       default:

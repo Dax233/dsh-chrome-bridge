@@ -1,6 +1,6 @@
 # dsh-chrome-bridge
 
-控制用户真实 Chrome 的 DSH 插件：Host 侧 `chrome` 工具 + MV3 扩展（`chrome.debugger`），支持后台标签、DSH Agent 标签组、UIA refs、动作回执、console/network 日志、iframe 观测与 frame 内点击，以及参数化截图（fullPage/clip/元素/格式）、CDP 设备视口与配色仿真、networkIdle 等待。
+控制用户真实 Chrome 的 DSH 插件：Host 侧 `chrome` 工具 + MV3 扩展（`chrome.debugger`），支持后台标签、DSH Agent 标签组、UIA refs、动作回执、console/network 日志、iframe 观测与 frame 内点击，以及参数化截图（fullPage/clip/元素/格式）、CDP 设备视口与配色仿真、networkIdle 等待；`status` 能看到扩展侧的**窗口/标签组真实状态**（连上没有窗口时不再误报“可用”），标签组会复用/合并而不是重复新建。
 
 ## 组成
 
@@ -35,6 +35,8 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 安全/行为要点：
 
 - 只有 **DSH Agent 标签组** 内的 tab 可被驱动；`newTab` 自动入组，`attach` 是显式 opt-in（用户把 tab 拖出组即撤销）。
+- **连接 ≠ 可用**：Chrome 关掉最后一个窗口后台进程仍在时，WebSocket/心跳还活着。`status` 的 `usableWindows` 与扩展 state（`normalWindows/windows/tabs/agentGroups/savedGroupPossible`）会指出“已连接但没有窗口”，`tabs` 也会返回 windowless 文案；`newTab` 会让 Chrome 自动开窗。
+- **组只复用、不盲目新建**：每次 `newTab/attach` 先实时查询所有打开的 “DSH Agent” 组（优先同窗口），失败时重查一次再决定是否建组；同一窗口的重复组会自动合并，回执带 `groupAction: created|reused` 与 `groupsMerged`。
 - 快照使用 Host 侧 `n<backendNodeId>` refs；动作带 settle/回执。
 - `logs` 支持 `filter`/`clear`；`wait` 支持 selector/text/networkIdle/idleMs/ms（多条件 AND）；`upload` 用 `DOM.setFileInputFiles`。
 - `screenshot {format?, quality?, fullPage?, clip?, ref?, selector?}`：`fullPage`/`clip`/`ref`/`selector` 只能选一种；`clip` 是**视口（CSS px）坐标**，`ref`/`selector` 会先滚动到目标再按视口坐标截取；`fullPage` 临时把仿真视口拉高到内容高度再截、随后恢复。Host 按格式落盘并回填真实像素尺寸。
@@ -56,13 +58,24 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 - 登录账号的 GitHub 用页面级 `data-color-mode` 强制裁剪：真实 Chrome 里 CDP `colorScheme` 可能改不动它的配色。主题相关的 QA 建议在**未登录 / 独立 profile / 无痕**窗口里做。
 - **不是 CI/离屏浏览器**：需要真实 Chrome 在运行、扩展已连接。无头/批量验收请用 sidebar 侧栏插件的 `qa` 或外部 CDP/Playwright，本插件不承诺离屏能力。
 
+## 已知边界：Chrome 的 saved tab groups
+
+Chrome 会在**窗口关闭时把带标题的标签组存为 saved tab group**（书签栏里的「已保存的标签组」）。扩展 API
+`chrome.tabGroups.query` 只返回当前打开的组，也没有任何 API 能读取/重新打开/删除 saved group。因此：
+
+- 关窗后第一次 `newTab` 必然要新建一个 “DSH Agent” 组；旧组由 Chrome 保留成 saved 条目，桥无法复用。
+  此时 `newTab/attach` 回执会带 `savedGroupPossible:true` 的 warning，`status.note` 也会提示去书签栏处理。
+- 用户从书签栏重新打开旧 saved 组、与新建组同时存在时，桥会把**同一窗口**内的重复组自动合并（回执
+  `groupsMerged>0`）；不同窗口的同名组会保留，但 ACL 接受任意一个打开的 “DSH Agent” 组。
+- 想彻底避免历史 saved 条目，只能在 Chrome 里手动关闭/删除（或在关窗前把 agent tab 移出组）。
+
 ## 开发
 
 ```sh
 npm test
 ```
 
-测试覆盖 WebSocket 握手/安全、Host 工具往返、扩展 controller（含截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
+测试覆盖 WebSocket 握手/安全与状态快照、Host 工具往返与 status/窗口诊断、扩展 controller（含组复用/合并/ACL、截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
 
 ## License
 

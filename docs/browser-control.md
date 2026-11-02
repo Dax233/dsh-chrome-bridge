@@ -672,3 +672,60 @@ beacon/长连接请求（Ping/WebSocket 等）不按对产生 `Network.loadingFi
 - 待真机复验（需 reload 扩展 0.1.30）：github.com 上 `wait {networkIdle:true}` 应在 ms 内 best-effort
   返回 ok + pending + warning；普通页面仍真正等 idle。版本 0.1.30。
 
+
+### 34.10 断连状态与重复建组修复（2026-11-02，0.1.30 → 0.1.31）
+
+用户反馈：①「手动取消连接 / 关闭浏览器窗口后，chrome 桥仍显示已连接」；②「模型在已有标签组时重新调起
+chrome 桥会重复建组」。以下均为真机复现（Chrome 156，真实用户 profile，`chrome.debugger` 扩展从仓库目录加载）。
+
+**复现与根因**
+
+1. **窗口关掉了，桥仍然“已连接”**。关闭 Chrome 的最后一个普通窗口后，Chrome 进程并不退出（后台/扩展
+   常驻），扩展的 MV3 service worker 也活着：WebSocket 仍开着，应用层 ping/pong 正常，于是 Host `status`
+   只看到 `extension.connectedAt` 就报“connected”。但 `chrome.windows.getAll({windowTypes:["normal"]})`
+   为空、`chrome.tabs.query({})` 为空，所有标签动作都没有可操作对象；旧的 `status` 完全没有窗口维度，
+   `tabs` 还会把空列表说成 "no visible tabs"，把“桥在、浏览器没窗口”误报成“正常”。
+   实测：关掉最后一个窗口后，`status` 的 `connectedAt` 连续数小时不变（0.1.30 行为）。
+2. **重复建组**。控制器的 `ensureAgentGroup` 缓存 `agentGroupId`；窗口关闭后该 id 失效，下一次
+   `newTab/attach` 进入 fallback：**直接** `chrome.tabs.group({tabIds})` 新建组，不重新查询已有组。
+   同时，Chrome 会把带标题的组在**窗口关闭时自动存为 “saved tab group”**（书签栏里的已保存标签组），
+   而 `chrome.tabGroups.query` 只返回当前打开的组、扩展 API 也无法访问/重新打开 saved group。结果每经历
+   一次「关窗口 → 再 newTab」就多一个同名 “DSH Agent” 组：真机在书签栏累计到 4 个 DSH Agent 组
+   （1 个打开 + 3 个已保存）。旧 ACL 还只认缓存的单个 group id：窗口一关，新窗口里所有 tab 都被判
+   “not in the DSH Agent group; call attach first”，即用户看到的“空白标签页也不接管”。
+
+**0.1.31 修复**
+
+- 扩展新增 `state` 快照命令，并在 pong 心跳里附带快照：`{normalWindows, windows[], tabs, agentGroups[],
+  agentGroupId, savedGroupPossible, lastWindowCloseAt}`；窗口/标签组事件（`windows.onCreated/onRemoved`、
+  `tabGroups.onCreated/onUpdated/onRemoved`）会失效缓存并主动 `{type:"state"}` 推送给 Host。
+- Host `status` 合并实时快照，新增 `usableWindows`；`normalWindows===0` 时给出明确 hint（桥已连接但
+  Chrome 没有窗口；`newTab` 会让 Chrome 新建窗口；旧组可能被 Chrome 存成 saved group）。`tabs` 在
+  零 tab 且无窗口时返回 windowless 文案而不是 "no visible tabs"。`ws.js` 把快照存进 `status()` 与
+  `chrome-bridge-state.json`，`sanitizeState` 保证坏快照不会污染输出。旧版扩展（不认 `state`）只是
+  status/空 tabs 多等 1.5s 超时后回退，不影响功能。
+- 组逻辑以 `tabGroups.query({})` 的**实时结果**为准：缓存 id 只作提示；`ensureAgentGroup` 每次先查
+  全部候选组，优先同窗口组、其次缓存 id、最后第一个；`tabs.group` 失败时**重新查询一次再决定是否新建**
+  （不再盲目新建）。同一窗口里出现多个 “DSH Agent” 组时把它们的 tab 合并进主组（`tabs.group` 会删除
+  被清空的组），`attach/newTab` 回执带 `groupAction: created|reused`、`groupsMerged`。
+- ACL 改为「tab 属于任意一个打开的 DSH Agent 组即可」，不再信任单一缓存 id；无打开组时 ACL 不拦
+  （窗口关闭后新窗口 tab 恢复可控），并在成员判断失败时强制刷新一次组缓存。
+- 窗口关闭后首次新建组时，扩展用 `windows.get(旧窗口)` 判定“组是被窗口关闭带走的”，回执附
+  `savedGroupPossible:true` + warning（Chrome 把旧组存成了 saved tab group，API 无法重开/删除，
+  需用户从书签栏 saved tab groups 里重开或关掉多余条目）。`status` 也会预测并持续提示该状态。
+- `newTab` 在无窗口时若 `tabs.create` 抛错，回退 `chrome.windows.create` 显式开窗口，仍能完成建 tab + 建组。
+- **平台边界（无法在扩展侧消除）**：Chrome 的 saved tab groups 没有扩展 API。桥不能再复用“已保存/已关闭”
+  的组，只能在新建组时如实回执、并合并所有**仍打开**的同名重复组。要彻底避免历史 saved 条目，需用户在
+  Chrome 书签栏手动清理（或在关窗前先把组内 tab 移出）。
+
+**测试**
+
+- controller 新增 8 项：第二个 tab 复用组、失效缓存重新查询并复用他组（不新建）、窗口关闭后新建组带
+  saved warning、同窗口重复组合并、ACL 接受任意 DSH Agent 组、无组时 ACL 放行、state 快照（含窗口/组/
+  预测 saved 状态）、窗口事件推送快照。
+- ws/host 新增 20 项：pong 携带 state 落盘、主动 state 推送、坏快照 sanitize、status 有/无窗口、空 tabs
+  两分支、newTab 诊断文案、纯格式化 helper。
+- 全套 **111 项全绿**（基线 88）；真机复验：无窗口时 `status.usableWindows=0` + hint、`tabs` 的
+  windowless 文案、`newTab` 自动开窗并回执 saved warning、扩展 reload 后仍复用同一组、组数量不增长；
+  Host 半需重启 DSH 生效（安装副本已同步）。
+- 版本：package.json / manifest / Hello 帧统一 **0.1.31**。

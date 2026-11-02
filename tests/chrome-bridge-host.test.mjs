@@ -97,15 +97,41 @@ function waitOpen(socket) {
   });
 }
 
+/** Default browser snapshot a 0.1.31+ fake extension reports for `{type:"state"}`. */
+const DEFAULT_STATE = {
+  at: 1_700_000_000_000,
+  normalWindows: 1,
+  windows: [{ id: 1, focused: true, tabCount: 1 }],
+  tabs: 1,
+  agentGroups: [{ id: 5, windowId: 1, title: "DSH Agent", tabCount: 1, collapsed: false }],
+  agentGroupId: 5,
+  savedGroupPossible: false,
+  lastWindowCloseAt: null,
+};
+
+/** The state after the user closed every Chrome window. */
+const NO_WINDOW_STATE = {
+  at: 1_700_000_100_000,
+  normalWindows: 0,
+  windows: [],
+  tabs: 0,
+  agentGroups: [],
+  agentGroupId: null,
+  savedGroupPossible: true,
+  lastWindowCloseAt: "2026-11-02T09:00:00.000Z",
+};
+
 /** Fake Chrome extension: answers CDP-style commands with canned results. */
-function startFakeExtension(port, received) {
+function startFakeExtension(port, received, options = {}) {
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ext`);
   const answer = (cmd) => {
     switch (cmd.type) {
       case "list-tabs":
-        return { ok: true, tabs: [{ id: 1, title: "Example Domain", url: "https://example.com/", active: true }] };
+        return { ok: true, tabs: options.tabs ?? [{ id: 1, title: "Example Domain", url: "https://example.com/", active: true }] };
+      case "state":
+        return { ok: true, ...(options.state ?? DEFAULT_STATE) };
       case "new-tab":
-        return { ok: true, tabId: 77, url: cmd.url, active: cmd.active === true };
+        return { ok: true, tabId: 77, url: cmd.url, active: cmd.active === true, ...(options.newTab ?? {}) };
       case "close-tab":
         return { ok: true, tabId: cmd.tabId };
       case "screenshot": {
@@ -249,6 +275,154 @@ test("status without an extension explains how to connect", async () => {
   } finally {
     harness.disposeAll();
   }
+});
+
+test("status with a no-window snapshot reports usableWindows 0 and a no-window hint", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received, { state: NO_WINDOW_STATE });
+    await extension.ready;
+    const payload = JSON.parse((await harness.tools[0].execute({ action: "status" })).text);
+    assert.equal(payload.extension.name, "fake-extension");
+    assert.equal(payload.usableWindows, 0);
+    assert.equal(payload.extension.state.normalWindows, 0);
+    assert.match(payload.hint, /no open browser window/i);
+    assert.match(payload.hint, /newTab/);
+    assert.match(payload.note, /bookmark bar/i);
+    assert.equal(received.at(-1).type, "state");
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("status with an open window reports usableWindows and no no-window hint", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received, {
+      state: {
+        ...DEFAULT_STATE,
+        normalWindows: 1,
+        windows: [{ id: 3, focused: true, tabCount: 2 }],
+        tabs: 2,
+        agentGroups: [{ id: 8, windowId: 3, title: "DSH Agent", tabCount: 1, collapsed: false }],
+        agentGroupId: 8,
+      },
+    });
+    await extension.ready;
+    const payload = JSON.parse((await harness.tools[0].execute({ action: "status" })).text);
+    assert.equal(payload.usableWindows, 1);
+    assert.equal(payload.hint, undefined);
+    assert.equal(payload.note, undefined);
+    assert.deepEqual(payload.extension.state.windows, [{ id: 3, focused: true, tabCount: 2 }]);
+    assert.equal(payload.extension.state.agentGroups[0].title, "DSH Agent");
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("tabs with zero tabs and no Chrome window explains that Chrome has no window", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received, { tabs: [], state: NO_WINDOW_STATE });
+    await extension.ready;
+    const result = await harness.tools[0].execute({ action: "tabs" });
+    assert.match(result.text, /no open browser window/i);
+    assert.match(result.text, /newTab/);
+    assert.notEqual(result.text, "no visible tabs");
+    assert.equal(received.at(-1).type, "state");
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("tabs with zero tabs and an open window keeps the existing no-visible-tabs text", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received, { tabs: [], state: DEFAULT_STATE });
+    await extension.ready;
+    const result = await harness.tools[0].execute({ action: "tabs" });
+    assert.equal(result.text, "no visible tabs");
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("newTab text appends extension group diagnostics", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received, {
+      newTab: { warning: "Chrome saved the previous DSH Agent group when its window closed", groupAction: "created", savedGroupPossible: true, groupsMerged: 2 },
+    });
+    await extension.ready;
+    const result = await harness.tools[0].execute({ action: "newTab", url: "https://example.com/new" });
+    assert.match(result.text, /created tab 77/);
+    assert.match(result.text, /\[warning: Chrome saved the previous DSH Agent group/);
+    assert.match(result.text, /\[merged 2 duplicate group\(s\)\]/);
+    assert.match(result.text, /\[merged 2 duplicate group\(s\)\]/);
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("formatResult appends group warnings only when the extension reports them", () => {
+  const { formatResult } = plugin.__test;
+  const plain = formatResult("newTab", { tabId: 7, url: "https://example.com/", active: false });
+  assert.doesNotMatch(plain, /warning|merged|saved/i);
+  const warned = formatResult("attach", {
+    tabId: 7,
+    grouped: true,
+    warning: "boom",
+    groupsMerged: 1,
+    groupAction: "created",
+    savedGroupPossible: true,
+  });
+  assert.match(warned, /\[warning: boom\]/);
+  assert.match(warned, /\[merged 1 duplicate group\(s\)\]/);
+  // The explicit warning already explains the saved group; do not repeat it.
+  assert.doesNotMatch(warned, /saved by Chrome/i);
+  const savedOnly = formatResult("newTab", { tabId: 8, grouped: true, groupAction: "created", savedGroupPossible: true });
+  assert.match(savedOnly, /saved by Chrome/i);
+});
+
+test("statusReport merges the live snapshot over the stale bridge snapshot", () => {
+  const { statusReport } = plugin.__test;
+  const stale = { normalWindows: 1, windows: [], tabs: 0, agentGroups: [], agentGroupId: null, savedGroupPossible: false, lastWindowCloseAt: null };
+  const live = { normalWindows: 0, windows: [], tabs: 0, agentGroups: [], agentGroupId: null, savedGroupPossible: true, lastWindowCloseAt: "2026-11-02T09:00:00.000Z" };
+  const status = { listening: true, port: 47835, pending: 0, extension: { name: "ext", version: "0.1.31", connectedAt: "a", lastSeenAt: "b", state: stale } };
+  const report = statusReport(status, live, "connect hint");
+  assert.equal(report.extension.state, live);
+  assert.equal(report.usableWindows, 0);
+  assert.match(report.hint, /no open browser window/i);
+  assert.match(report.note, /bookmark bar/i);
+  const disconnected = statusReport({ listening: true, port: 1, pending: 0, extension: null }, null, "connect hint");
+  assert.equal(disconnected.extension, null);
+  assert.equal(disconnected.usableWindows, null);
+  assert.equal(disconnected.hint, "connect hint");
 });
 
 test("unknown actions are rejected", async () => {
