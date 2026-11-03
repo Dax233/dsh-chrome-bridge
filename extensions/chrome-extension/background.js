@@ -72,7 +72,7 @@ async function connect() {
     console.info(`[dsh-chrome-bridge] connected to Host (ws://127.0.0.1:${port}/ext)`);
     try {
       // The token is a handshake field, not a URL query: URLs leak into logs.
-      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.32", token }));
+      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.33", token }));
     } catch {
       // The close handler will reconnect.
     }
@@ -129,6 +129,17 @@ async function connect() {
     if (socket === ws) socket = null;
     const code = typeof event?.code === "number" ? event.code : "?";
     console.warn(`[dsh-chrome-bridge] host connection closed (code ${code}); retrying`);
+    // No Host means no more commands can arrive: release chrome.debugger
+    // sessions so Chrome's "…is debugging this browser" infobar does not
+    // outlive the connection (the next CDP action re-attaches).
+    void controller
+      .detachAll()
+      .then((result) => {
+        if (result.detached > 0) console.info(`[dsh-chrome-bridge] detached ${result.detached} tab(s) after Host disconnect`);
+      })
+      .catch(() => {
+        // Best-effort only; never block reconnection.
+      });
     scheduleReconnect();
   });
   ws.addEventListener("error", () => {

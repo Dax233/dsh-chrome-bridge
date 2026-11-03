@@ -591,6 +591,8 @@ export function createChromeController(chromeApi, options = {}) {
       tabs: tabs.filter((tab) => windowIds.has(tab?.windowId)).length,
       agentGroups,
       agentGroupId: typeof agentGroupId === "number" ? agentGroupId : null,
+      /** Tabs the bridge currently holds a chrome.debugger session on (the infobar set). */
+      attachedTabs: [...attached],
       savedGroupPossible: savedGroupPossible || savedGroupPredicted,
       lastWindowCloseAt: lastWindowCloseAt ?? null,
     };
@@ -1165,6 +1167,31 @@ export function createChromeController(chromeApi, options = {}) {
     releaseTabState(id);
     await chromeApi.debugger.detach({ tabId: id });
     return { ok: true, tabId: id, ...(emulationReset ? { emulationReset: true } : {}) };
+  }
+
+  /**
+   * End every chrome.debugger session this bridge opened, restoring emulation
+   * first. Used at turn wrap-up and on Host disconnect so Chrome's
+   * "…is debugging this browser" infobar does not outlive the agent work.
+   */
+  async function detachAll() {
+    const tabIds = [...attached];
+    const detached = [];
+    for (const tabId of tabIds) {
+      try {
+        if (emulationByTab.has(tabId)) await applyEmulationReset(tabId);
+      } catch {
+        // Resetting emulation is best-effort; the session goes away anyway.
+      }
+      releaseTabState(tabId);
+      try {
+        await chromeApi.debugger.detach({ tabId });
+        detached.push(tabId);
+      } catch {
+        // Chrome may have ended the session already (tab closed, infobar cancelled).
+      }
+    }
+    return { ok: true, detached: detached.length, tabIds: detached };
   }
 
   async function navigate(tabId, url) {
@@ -2075,6 +2102,8 @@ export function createChromeController(chromeApi, options = {}) {
           return await attach(command.tabId);
         case "detach":
           return await detach(command.tabId);
+        case "detach-all":
+          return await detachAll();
         case "navigate":
           return await navigate(command.tabId, command.url);
         case "snapshot":
@@ -2113,6 +2142,7 @@ export function createChromeController(chromeApi, options = {}) {
     listTabs,
     attach,
     detach,
+    detachAll,
     navigate,
     snapshot,
     click,

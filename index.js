@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createExtensionBridge, sanitizeState } from "./ws.js";
+import { createAutoDetach } from "./auto-detach.js";
 
 export const name = "chrome-extension-bridge";
 export const inject = ["tools"];
@@ -19,8 +20,10 @@ const TOKEN = process.env.DSH_CHROME_BRIDGE_TOKEN ?? "dsh-chrome-bridge-local";
 const STATE_FILE = process.env.DSH_CHROME_BRIDGE_STATE ?? join(tmpdir(), "dsh-chrome-bridge-state.json");
 const COMMAND_TIMEOUT_MS = Number(process.env.DSH_CHROME_BRIDGE_COMMAND_TIMEOUT_MS ?? 20_000);
 const SHOT_DIR = process.env.DSH_CHROME_BRIDGE_SHOT_DIR ?? join(tmpdir(), "dsh-chrome-shots");
+/** Detach debugger sessions when the last running turn ends (default on; 0 disables). */
+const AUTO_DETACH = process.env.DSH_CHROME_BRIDGE_AUTO_DETACH !== "0";
 
-const ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "navigate", "snapshot", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
+const ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "detachAll", "navigate", "snapshot", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
 
 /** Formats Page.captureScreenshot accepts; the file extension differs for jpeg. */
 const SCREENSHOT_FORMATS = new Set(["png", "jpeg", "webp"]);
@@ -161,7 +164,8 @@ const DESCRIPTION =
   "Actions: newTab {url, active?}, closeTab {tabId}, navigate {tabId,url}, snapshot {tabId}, click {tabId,ref|x,y}, " +
   "type {tabId,text,ref?}, key {tabId,key}, scroll {tabId,deltaY}, screenshot {tabId,format?,quality?,fullPage?,clip?,ref?,selector?}, " +
   "emulate {tabId,width?,height?,deviceScaleFactor?,mobile?,colorScheme?,reset?}, logs {tabId,limit?,filter?,clear?}, upload {tabId,ref,paths}, " +
-  "evaluate {tabId,expression}, wait {tabId,selector?,text?,networkIdle?,idleMs?,ms?}, detach {tabId}. " +
+  "evaluate {tabId,expression}, wait {tabId,selector?,text?,networkIdle?,idleMs?,ms?}, detach {tabId}, detachAll {}. " +
+  "Debugger sessions are detached automatically when the running turn ends, so Chrome's debugging infobar does not linger; action=detachAll clears them immediately (and after a Host disconnect the extension detaches too). " +
   "screenshot fullPage temporarily grows the emulated viewport and captures it (capped, real pixel size reported); clip is a viewport (CSS px) rectangle; ref/selector are scrolled into view first; format png|jpeg|webp (quality only for jpeg/webp). " +
   "emulate drives real CDP Emulation: device metrics and prefers-color-scheme in this tab. " +
   "This is a REAL Chrome tab, not a CI or offscreen browser: emulate temporarily changes how the user's tab renders (restored by emulate{reset:true}, detach or closeTab), " +
@@ -303,6 +307,8 @@ function toCommand(action, args) {
       return { type: "attach", tabId: requireTabId(args) };
     case "detach":
       return { type: "detach", tabId: requireTabId(args) };
+    case "detachAll":
+      return { type: "detach-all" };
     case "navigate":
       return { type: "navigate", tabId: requireTabId(args), url: requireHttpUrl(args.url) };
     case "snapshot":
@@ -537,6 +543,8 @@ function formatResult(action, value) {
       return `attached to tab ${value.tabId}${value.grouped ? " [tab group: DSH Agent]" : ""}${value.groupingError ? ` [grouping failed: ${String(value.groupingError)}]` : ""}${groupWarnings(value)}`;
     case "detach":
       return `detached from tab ${value.tabId}${value.emulationReset ? " (emulation restored)" : ""}`;
+    case "detachAll":
+      return `detached ${Number(value.detached ?? 0)} tab(s)${Array.isArray(value.tabIds) && value.tabIds.length > 0 ? ` (${value.tabIds.join(", ")})` : ""}`;
     case "navigate":
       return `navigated tab ${value.tabId} to ${String(value.url ?? "")}${value.title ? ` (${value.title})` : ""}`;
     case "snapshot":
@@ -671,6 +679,52 @@ export function apply(ctx) {
     return lastToolError;
   }
 
+  /** Last automatic debugger detach (turn end / session disposal), for diagnostics. */
+  let lastAutoDetach = null;
+
+  /**
+   * Detach every tab the extension is holding a chrome.debugger session on.
+   * Best-effort: never throws into a lifecycle listener, short timeout so a
+   * wedged service worker cannot stall a turn.
+   */
+  async function detachAllTabs(reason) {
+    const status = bridge.status();
+    if (status.extension === null) return { skipped: true, detected: 0, detached: 0 };
+    const outcome = await bridge.sendCommand({ type: "detach-all" }, 1500);
+    const value = outcome?.value;
+    const detached = value !== null && typeof value === "object" && value.ok === true ? Number(value.detached ?? 0) : 0;
+    lastAutoDetach = { at: new Date().toISOString(), reason: String(reason), detached };
+    bridge.writeState({ autoDetach: lastAutoDetach });
+    return { detached };
+  }
+
+  // Chrome's "…is debugging this browser" infobar should not outlive the agent
+  // work: detach when the last running turn ends (or the session is disposed).
+  const autoDetach = createAutoDetach({
+    enabled: AUTO_DETACH,
+    detach: detachAllTabs,
+    log: (message) => console.warn(`[chrome-bridge] ${message}`),
+  });
+  if (typeof ctx.on === "function") {
+    ctx.effect(() => {
+      // Scoped Host events need `global: true` from a root plugin context.
+      const globalOptions = { global: true };
+      const disposers = [
+        ctx.on("session/event", (session, event) => autoDetach.handleSessionEvent(session?.id, event), globalOptions),
+        ctx.on("session/disposed", (session) => autoDetach.handleSessionDisposed(session?.id), globalOptions),
+      ];
+      return () => {
+        for (const dispose of disposers) {
+          try {
+            dispose?.();
+          } catch {
+            // ignore
+          }
+        }
+      };
+    }, "chrome-bridge.auto-detach");
+  }
+
   /** The MV3 service worker reconnects within a second or two; wait instead of failing. */
   async function waitForExtension(timeoutMs = 2500) {
     const started = Date.now();
@@ -723,7 +777,7 @@ export function apply(ctx) {
       return { text: `waited ${ms}ms` };
     }
     if (action === "status") {
-      const status = bridge.status();
+      const status = { ...bridge.status(), ...(lastAutoDetach === null ? {} : { lastAutoDetach }) };
       const state = status.extension === null ? null : await extensionState();
       return { text: JSON.stringify(statusReport(status, state, connectHint(), lastToolError), null, 2) };
     }

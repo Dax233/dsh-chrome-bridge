@@ -794,3 +794,36 @@ chrome 桥会重复建组」。以下均为真机复现（Chrome 156，真实用
   “DSH Agent” 组（0.1.32 前同场景分组失败，`attach` 回执 `grouping failed: Tabs can only be moved...`）；
   `snapshot` 在该恢复窗口的标签上正常。
 - Host 0.1.32 的 status/lastError/hint 由单测覆盖（真机 Host 需重启 DSH 后生效）。
+
+### 34.12 会话收尾自动 detach 调试会话（2026-11-03，0.1.32 → 0.1.33）
+
+需求（用户）：桥的 WebSocket 跨会话常连是预期，但 Chrome 的「DSH Chrome Bridge 正在调试此浏览器」提示条
+不应在会话收尾后继续挂着。0.1.33 增加「最后一个运行中的 turn 结束时自动 detach 全部标签」，
+并新增 `chrome detachAll` 手动动作；扩展在 Host 连接断开时也会自行 detach（防 DSH 退出后提示条残留）。
+
+**实现**
+
+- 扩展 `controller.js`：新增 `detachAll()`（逐个 `applyEmulationReset` → 清 per-tab 记录 →
+  `chrome.debugger.detach`，幂等；返回 `{ok, detached, tabIds}`）；`state` 快照新增 `attachedTabs`
+  （当前仍持有 debugger 会话的标签，供诊断/测试）；`execute` 增加 `detach-all` 命令。
+- 扩展 `background.js`：WebSocket `close` 时 best-effort `detachAll()`（Host 重启/退出/崩溃后不再残留
+  调试提示条；下一轮需要 CDP 的动作会自动重新 attach）。
+- Host `auto-detach.js`（新文件）：纯逻辑协调器。监听 DSH 的 `session/event`（`turn/start`/`turn/end`，
+  durable 事件，含取消原因；`{global:true}` 从根插件上下文订阅 scoped 事件）与 `session/disposed`；
+  维护 per-session active turn，**只有当最后一个活跃 turn 结束时**才发送 `detach-all`（父子 subagent
+  并发时不会打断别人）；200ms 内多次收尾合并为一次；`DSH_CHROME_BRIDGE_AUTO_DETACH=0` 可关闭。
+- Host `index.js`：新增工具动作 `detachAll`（→ `{type:"detach-all"}`）；`status` 增加
+  `lastAutoDetach: {at, reason, detached}`；自动 detach 失败只记日志/状态，绝不影响 turn 收尾；
+  `auto-detach.js` 已加入 npm `files`。
+- 版本 0.1.33（package.json / manifest / Hello 帧）；Host 半需重启 DSH 生效。
+
+**验证与边界**
+
+- 单测：`tests/auto-detach.test.mjs`（6 项：最后 turn 才 detach、跨会话 turn 跟踪、session disposed
+  冲刷、disabled、快速收尾合并、失败不抛）；controller 新增 detachAll 幂等/attachedTabs 断言；host
+  集成测试（fake ctx 注入 `session/event` → 验证 `detach-all` 发到扩展、双会话时不提前 detach、
+  `status.lastAutoDetach`、`detachAll` 工具文案）。全套 **128 项全绿**（基线 119）。
+- 真机验证（需 DSH 重启到 0.1.33 后）：turn 结束应看到 Chrome 调试提示条消失；`chrome detachAll`
+  可立即清理；扩展/Chrome 退出导致的断连由扩展侧自行 detach 兜底。
+- 已知边界：多会话**同时**运行时，detach 针对的是全部调试会话（桥不按会话区分 attach 归属）；
+  如果另一会话正在用 CDP，它会在下一个动作时自动重新 attach，只会有提示条短暂闪烁，不影响命令。

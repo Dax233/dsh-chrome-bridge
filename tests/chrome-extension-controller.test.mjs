@@ -240,6 +240,26 @@ test("attach and detach call chrome.debugger with the tab target", async () => {
   assert.deepEqual(calls.find((call) => call.method === "debugger.detach").target, { tabId: 7 });
 });
 
+test("detachAll ends every debugger session and clears the attached-tab state", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+  await controller.attach(2);
+  const before = await controller.snapshotState();
+  assert.deepEqual([...before.attachedTabs].sort((a, b) => a - b), [1, 2]);
+  const result = await controller.execute({ type: "detach-all" });
+  assert.equal(result.ok, true);
+  assert.equal(result.detached, 2);
+  assert.deepEqual([...result.tabIds].sort((a, b) => a - b), [1, 2]);
+  const detachedTabIds = calls.filter((call) => call.method === "debugger.detach").map((call) => call.target.tabId).sort((a, b) => a - b);
+  assert.deepEqual(detachedTabIds, [1, 2]);
+  const after = await controller.snapshotState();
+  assert.deepEqual(after.attachedTabs, []);
+  const again = await controller.execute({ type: "detach-all" });
+  assert.equal(again.ok, true);
+  assert.equal(again.detached, 0, "detachAll is idempotent when nothing is attached");
+});
+
 test("navigate validates the URL and sends Page.navigate", async () => {
   const { chromeApi, calls } = makeChromeMock();
   const controller = createChromeController(chromeApi);

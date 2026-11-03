@@ -14,7 +14,7 @@ process.env.DSH_CHROME_BRIDGE_SHOT_DIR = join(mkdtempSync(join(tmpdir(), "dsh-ch
 
 const plugin = await import("../index.js");
 
-const EXPECTED_ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "navigate", "snapshot", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
+const EXPECTED_ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "detachAll", "navigate", "snapshot", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
 
 /** Minimal PNG header: the host only parses the IHDR pixel size. */
 function makePngHeader(width, height) {
@@ -68,11 +68,22 @@ const WEBP_320X240_BASE64 = makeWebpHeader(320, 240).toString("base64");
 function makeContext() {
   const tools = [];
   const disposers = [];
+  /** event name -> [{ listener, options }] */
+  const listeners = new Map();
   const ctx = {
     effect(execute) {
       const dispose = execute();
       if (typeof dispose === "function") disposers.push(dispose);
       return dispose;
+    },
+    on(name, listener, options) {
+      const entries = listeners.get(name) ?? [];
+      entries.push({ listener, options });
+      listeners.set(name, entries);
+      return () => {
+        const current = listeners.get(name) ?? [];
+        listeners.set(name, current.filter((entry) => entry.listener !== listener));
+      };
     },
     tools: {
       register(definition) {
@@ -84,6 +95,11 @@ function makeContext() {
   return {
     ctx,
     tools,
+    listeners,
+    /** Deliver one Host event to the listeners a plugin registered. */
+    emit(name, ...args) {
+      for (const { listener } of listeners.get(name) ?? []) listener(...args);
+    },
     disposeAll() {
       for (const dispose of disposers.splice(0).reverse()) dispose();
     },
@@ -177,6 +193,8 @@ function startFakeExtension(port, received, options = {}) {
         return { ok: true, tabId: cmd.tabId };
       case "detach":
         return { ok: true, tabId: cmd.tabId };
+      case "detach-all":
+        return { ok: true, detached: 1, tabIds: [1] };
       case "navigate":
         return { ok: true, tabId: cmd.tabId, url: cmd.url, title: "Example Domain" };
       case "snapshot":
@@ -398,8 +416,7 @@ test("tabs recovers a transiently empty list on the retry", async () => {
   }
 });
 
-test("failed actions are recorded in status.lastError and formatted with a recovery hint", async () => {
-  const harness = makeContext();
+test("failed actions are recorded in status.lastError and formatted with a recovery hint", async () => {  const harness = makeContext();
   plugin.apply(harness.ctx);
   const received = [];
   let extension;
@@ -516,6 +533,62 @@ test("statusReport merges the live snapshot over the stale bridge snapshot", () 
   assert.equal(disconnected.extension, null);
   assert.equal(disconnected.usableWindows, null);
   assert.equal(disconnected.hint, "connect hint");
+});
+
+test("auto-detach runs on the last turn end and is visible in status.lastAutoDetach", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received);
+    await extension.ready;
+    harness.emit("session/event", { id: "session-x" }, { type: "turn/start", data: { turn: 1 } });
+    harness.emit("session/event", { id: "session-y" }, { type: "turn/start", data: { turn: 1 } });
+    harness.emit("session/event", { id: "session-x" }, { type: "turn/end", data: { turn: 1 } });
+    for (let attempt = 0; attempt < 50 && !received.some((command) => command.type === "detach-all"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(received.some((command) => command.type === "detach-all"), false, "another session is still running");
+    harness.emit("session/event", { id: "session-y" }, { type: "turn/end", data: { turn: 1 } });
+    for (let attempt = 0; attempt < 50 && !received.some((command) => command.type === "detach-all"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(received.some((command) => command.type === "detach-all"), "detach-all must be sent when the last turn ends");
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const status = JSON.parse((await harness.tools[0].execute({ action: "status" })).text);
+      if (status.lastAutoDetach !== undefined) {
+        assert.equal(status.lastAutoDetach.detached, 1);
+        assert.equal(status.lastAutoDetach.reason, "turn-end");
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const detachAll = await harness.tools[0].execute({ action: "detachAll" });
+    assert.match(detachAll.text, /detached 1 tab\(s\)/);
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("detachAll reaches the extension and formats its count", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received);
+    await extension.ready;
+    const result = await harness.tools[0].execute({ action: "detachAll" });
+    assert.equal(result.text, "detached 1 tab(s) (1)");
+    assert.deepEqual(received.map((command) => command.type), ["detach-all"]);
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
 });
 
 test("unknown actions are rejected", async () => {

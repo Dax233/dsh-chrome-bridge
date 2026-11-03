@@ -30,12 +30,13 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 
 ## 工具面
 
-`chrome(action)`：`status`、`tabs`、`newTab`、`closeTab`、`attach`、`detach`、`navigate`、`snapshot`、`click`、`type`、`key`、`scroll`、`screenshot`、`emulate`、`logs`、`upload`、`evaluate`、`wait`。
+`chrome(action)`：`status`、`tabs`、`newTab`、`closeTab`、`attach`、`detach`、`detachAll`、`navigate`、`snapshot`、`click`、`type`、`key`、`scroll`、`screenshot`、`emulate`、`logs`、`upload`、`evaluate`、`wait`。
 
 安全/行为要点：
 
 - 只有 **DSH Agent 标签组** 内的 tab 可被驱动；`newTab` 自动入组，`attach` 是显式 opt-in（用户把 tab 拖出组即撤销）。
-- **连接 ≠ 可用**：Chrome 关掉最后一个窗口后台进程仍在时，WebSocket/心跳还活着。`status` 的 `usableWindows`、`windowState`（`disconnected`/`unknown`/`windowless`/`no-agent-group`/`ready`）、`lastError` 与扩展 state（`normalWindows/windows/tabs/agentGroups/savedGroupPossible`）会指出“已连接但没有窗口/没有 Agent 组”，`tabs` 也会返回 windowless 文案并在“有窗口但列不出标签”时自动重试+诊断。
+- **调试提示条不跨轮残留**：桥的 WebSocket 跨 turn/session 常连（这是有意的控制通道），但 `chrome.debugger` 会话会在**最后一个运行中的 turn 结束**时自动全部 detach（父子 subagent 并发时等最后一个），所以 Chrome 的「…正在调试此浏览器」提示条随会话收尾消失；`chrome detachAll` 可立即手动清理，扩展在 Host 连接断开时也会自行 detach。`DSH_CHROME_BRIDGE_AUTO_DETACH=0` 可关闭自动 detach。
+- **连接 ≠ 可用**：Chrome 关掉最后一个窗口后台进程仍在时，WebSocket/心跳还活着。`status` 的 `usableWindows`、`windowState`（`disconnected`/`unknown`/`windowless`/`no-agent-group`/`ready`）、`lastError` 与扩展 state（`normalWindows/windows/tabs/agentGroups/attachedTabs/savedGroupPossible`）会指出“已连接但没有窗口/没有 Agent 组”，`tabs` 也会返回 windowless 文案并在“有窗口但列不出标签”时自动重试+诊断。
 - **无窗口自愈**：`newTab` 不再依赖 `current window`——每次实时解析 normal 窗口，零窗口时直接 `windows.create` 一个**聚焦**窗口（Chrome 156 对 `focused:false` 窗口的标签会拒绝分组），再建标签入组；`tabs.group` 命中 `Tabs can only be moved to and from normal windows.` 时先聚焦该窗口再重试一次。回执会注明 `[created a new Chrome window because none was open]`。
 - **组只复用、不盲目新建**：每次 `newTab/attach` 先实时查询所有打开的 “DSH Agent” 组（优先同窗口），失败时重查一次再决定是否建组；同一窗口的重复组会自动合并，回执带 `groupAction: created|reused` 与 `groupsMerged`。
 - 快照使用 Host 侧 `n<backendNodeId>` refs；动作带 settle/回执。
@@ -79,7 +80,7 @@ Chrome 会在**窗口关闭时把带标题的标签组存为 saved tab group**�
 npm test
 ```
 
-测试覆盖 WebSocket 握手/安全与状态快照、Host 工具往返与 status/窗口诊断（windowState/lastError/失败 hint/空 tabs 重试）、扩展 controller（含无窗口自愈、组复用/合并/ACL、Chrome 156 分组怪癖重试、截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
+测试覆盖 WebSocket 握手/安全与状态快照、Host 工具往返与 status/窗口诊断（windowState/lastError/失败 hint/空 tabs 重试）、turn 收尾自动 detach 协调器、扩展 controller（含无窗口自愈、detachAll、组复用/合并/ACL、Chrome 156 分组怪癖重试、截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
 
 ## License
 
