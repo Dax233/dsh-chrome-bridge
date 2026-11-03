@@ -82,6 +82,12 @@ export function sanitizeState(raw) {
       }));
   }
   state.agentGroupId = isFiniteNumber(raw.agentGroupId) ? raw.agentGroupId : null;
+  if (Array.isArray(raw.attachedTabs)) {
+    state.attachedTabs = raw.attachedTabs
+      .map((tabId) => Number(tabId))
+      .filter((tabId) => Number.isFinite(tabId) && tabId > 0)
+      .map((tabId) => Math.trunc(tabId));
+  }
   state.savedGroupPossible = raw.savedGroupPossible === true;
   state.lastWindowCloseAt = typeof raw.lastWindowCloseAt === "string" ? raw.lastWindowCloseAt : null;
   return state;

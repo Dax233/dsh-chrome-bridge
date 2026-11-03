@@ -409,4 +409,6 @@ test("sanitizeState: unit-level guards", () => {
   assert.equal(sanitizeState("nope"), null);
   assert.equal(sanitizeState([1, 2]), null);
   assert.deepEqual(sanitizeState({}), { agentGroupId: null, savedGroupPossible: false, lastWindowCloseAt: null });
+  assert.deepEqual(sanitizeState({ attachedTabs: ["3", 7, -1, "junk", null] }).attachedTabs, [3, 7], "attached tab ids are numbers > 0");
+  assert.equal(sanitizeState({ attachedTabs: "nope" }).attachedTabs, undefined);
 });

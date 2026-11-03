@@ -827,3 +827,7 @@ chrome 桥会重复建组」。以下均为真机复现（Chrome 156，真实用
   可立即清理；扩展/Chrome 退出导致的断连由扩展侧自行 detach 兜底。
 - 已知边界：多会话**同时**运行时，detach 针对的是全部调试会话（桥不按会话区分 attach 归属）；
   如果另一会话正在用 CDP，它会在下一个动作时自动重新 attach，只会有提示条短暂闪烁，不影响命令。
+
+**0.1.34（同日补丁）**：`ws.js` 的 `sanitizeState` 之前会丢弃扩展新增的 `attachedTabs` 字段，导致 `status.state.attachedTabs`
+实际不可见；0.1.34 把它加入白名单（仅保留 >0 的数字 tabId），并有单测覆盖。Host 半需下次重启 DSH 生效；
+不影响 0.1.33 的自动 detach 行为。
