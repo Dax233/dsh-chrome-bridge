@@ -57,16 +57,31 @@ function connectHint() {
 }
 
 /** Shown when the extension is attached but Chrome has no browser window left:
- * "connected" alone reads as usable, which is what the 0.1.31 bug report was. */
+ * "connected" alone reads as usable, which is what the 0.1.30/0.1.31 reports were. */
 const NO_WINDOW_HINT =
   "the chrome extension is connected, but Chrome has no open browser window, so there are no tabs to list or drive. " +
   "action=newTab will make Chrome create a window. If the previous DSH Agent group disappeared with its window, Chrome may " +
   "have kept it as a saved tab group in the bookmark bar: reopen it there (or expect one extra saved group) when relevant.";
 
+/** Shown when Chrome has windows but none carries the agent group. */
+const NO_AGENT_GROUP_HINT =
+  "Chrome has {n} open browser window(s), but no DSH Agent tab group, so there is no agent tab to drive. " +
+  "action=newTab creates a tab in the agent group, and action=attach {tabId} opts an existing tab in. If the previous agent " +
+  "window was closed, Chrome may have saved the old group as a saved tab group in the bookmark bar: reopen or delete it there.";
+
 /** Chrome saves a tab group when its window closes; agentGroups then no longer lists it. */
 const SAVED_GROUP_NOTE =
   "Chrome may have saved the DSH Agent group when its window closed instead of deleting it, so it can reappear as a saved " +
   "tab group in the bookmark bar; agentGroups lists only currently-open groups.";
+
+/** Classify the extension's browser snapshot so callers can tell the two empty states apart. */
+function windowStateOf(extension, state) {
+  if (extension === null) return "disconnected";
+  if (state === null || state === undefined) return "unknown";
+  if ((state.normalWindows ?? 0) === 0) return "windowless";
+  if (!Array.isArray(state.agentGroups) || state.agentGroups.length === 0) return "no-agent-group";
+  return "ready";
+}
 
 /** Group-lifecycle diagnostics the extension may attach to newTab/attach results. */
 function groupWarnings(value) {
@@ -87,11 +102,13 @@ function groupWarnings(value) {
  * Pure so tests can assert the JSON without a live extension; the connection
  * hint text is passed in because it depends on this plugin's filesystem.
  */
-function statusReport(status, state, connectHintText = "") {
+function statusReport(status, state, connectHintText = "", lastError = null) {
   const report = { ...status };
   const extension = status.extension;
+  if (lastError !== null && lastError !== undefined) report.lastError = lastError;
   if (extension === null) {
     report.usableWindows = null;
+    report.windowState = "disconnected";
     if (connectHintText !== "") report.hint = connectHintText;
     return report;
   }
@@ -99,7 +116,11 @@ function statusReport(status, state, connectHintText = "") {
   const snapshot = state ?? extension.state ?? null;
   report.extension = { ...extension, state: snapshot };
   report.usableWindows = snapshot === null ? null : (snapshot.normalWindows ?? null);
-  if (report.usableWindows === 0) report.hint = NO_WINDOW_HINT;
+  report.windowState = windowStateOf(extension, snapshot);
+  if (report.windowState === "windowless") report.hint = NO_WINDOW_HINT;
+  if (report.windowState === "no-agent-group") {
+    report.hint = NO_AGENT_GROUP_HINT.replace("{n}", String(snapshot?.normalWindows ?? "some"));
+  }
   if (snapshot?.savedGroupPossible === true) report.note = SAVED_GROUP_NOTE;
   return report;
 }
@@ -108,6 +129,27 @@ function statusReport(status, state, connectHintText = "") {
 function noWindowTabsText(state) {
   const saved = state?.savedGroupPossible === true ? " Chrome may have saved the previous DSH Agent group; check the bookmark bar." : "";
   return `no tabs: the chrome extension is connected, but Chrome has no open browser window. action=newTab will make Chrome create a window.${saved}`;
+}
+
+/** Recovery hint for a failure message, so callers do not need to read the code. */
+function failureHint(message) {
+  const text = String(message ?? "");
+  if (/no current window/i.test(text)) {
+    return "Chrome had no usable browser window; action=newTab creates one automatically — retry the action.";
+  }
+  if (/no tab with (given )?id|tab \d+ not found/i.test(text)) {
+    return "that tab no longer exists (its window or the tab was closed); call action=tabs or action=status, then action=newTab for a fresh tab.";
+  }
+  if (/not in the DSH Agent group/i.test(text)) {
+    return "the tab exists but is outside the DSH Agent group; action=attach with its tabId opts it in.";
+  }
+  return "";
+}
+
+/** Format a failed chrome action with its recovery hint. */
+function failureText(action, message) {
+  const hint = failureHint(message);
+  return `chrome ${action} failed: ${String(message)}${hint === "" ? "" : ` — ${hint}`}`;
 }
 
 const DESCRIPTION =
@@ -488,7 +530,7 @@ function formatResult(action, value) {
     case "newTab":
       return `created tab ${value.tabId}${value.url ? ` (${value.url})` : ""}${value.active ? " in the foreground" : " in the background"}${
         value.grouped ? " [tab group: DSH Agent]" : ""
-      }${groupWarnings(value)}`;
+      }${value.createdWindow ? " [created a new Chrome window because none was open]" : ""}${groupWarnings(value)}`;
     case "closeTab":
       return `closed tab ${value.tabId}${value.emulationReset ? " (emulation restored)" : ""}`;
     case "attach":
@@ -621,6 +663,14 @@ export function apply(ctx) {
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  /** Last failed tool call, surfaced by `action=status` and in the state file. */
+  let lastToolError = null;
+  function noteToolError(action, message) {
+    lastToolError = { at: new Date().toISOString(), action: String(action), message: String(message) };
+    bridge.writeState({ lastToolError });
+    return lastToolError;
+  }
+
   /** The MV3 service worker reconnects within a second or two; wait instead of failing. */
   async function waitForExtension(timeoutMs = 2500) {
     const started = Date.now();
@@ -660,6 +710,85 @@ export function apply(ctx) {
       return null;
     }
   }
+
+  /**
+   * One tool action. Failures are formatted with a recovery hint and recorded
+   * as `lastError` so `action=status` can show what broke without transcript digging.
+   */
+  async function runAction(action, args) {
+    if (action === "wait" && args.selector === undefined && args.text === undefined && args.networkIdle !== true && args.idleMs === undefined) {
+      // A pure delay needs no extension; selector/text/networkIdle waits must ask the page.
+      const ms = Math.max(0, Math.min(30_000, Number(args.ms ?? 1000)));
+      await sleep(ms);
+      return { text: `waited ${ms}ms` };
+    }
+    if (action === "status") {
+      const status = bridge.status();
+      const state = status.extension === null ? null : await extensionState();
+      return { text: JSON.stringify(statusReport(status, state, connectHint(), lastToolError), null, 2) };
+    }
+    const command = toCommand(action, args);
+    if (!(await waitForExtension(2500))) {
+      const text = `chrome: ${connectHint()}`;
+      noteToolError(action, text);
+      return { text };
+    }
+    let value;
+    try {
+      value = (await sendWithRetry(command)).value;
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      noteToolError(action, message);
+      console.warn(`[chrome-bridge] chrome ${action} failed: ${message}`);
+      return { text: failureText(action, message) };
+    }
+    if (value === undefined || value === null || value.ok !== true) {
+      const message = String(value?.error ?? "no result from the extension");
+      noteToolError(action, message);
+      console.warn(`[chrome-bridge] chrome ${action} failed: ${message}`);
+      return { text: failureText(action, message) };
+    }
+    if (action === "tabs" && (Array.isArray(value.tabs) ? value.tabs.length : 0) === 0) {
+      const handled = await emptyTabsResult();
+      if (handled !== null) return { text: handled };
+    }
+    if (action === "screenshot") {
+      const saved = saveScreenshot(value.data, value.format ?? command.format ?? "png");
+      return {
+        text: formatResult("screenshot", {
+          ...value,
+          file: saved.file,
+          bytes: saved.bytes,
+          format: saved.format,
+          ...(saved.image === undefined ? {} : { image: saved.image }),
+        }),
+      };
+    }
+    return { text: formatResult(action, value) };
+  }
+
+  /**
+   * An empty tab list has two very different causes; distinguish them and retry
+   * once when Chrome reports windows the extension could not list (stale worker).
+   */
+  async function emptyTabsResult() {
+    const state = await extensionState();
+    if (state !== null && (state.normalWindows ?? 0) === 0) return noWindowTabsText(state);
+    if (state !== null && (state.normalWindows ?? 0) > 0) {
+      await sleep(200);
+      try {
+        const retry = (await sendWithRetry({ type: "list-tabs" })).value;
+        if (retry?.ok === true && Array.isArray(retry.tabs) && retry.tabs.length > 0) return formatResult("tabs", retry);
+      } catch {
+        // Fall through to the diagnostic below.
+      }
+      const message = `Chrome reports ${state.normalWindows} open window(s) but the extension listed no tabs; the service worker may be stale`;
+      noteToolError("tabs", message);
+      return `${message} — retry the action, or reload the extension in chrome://extensions if it persists.`;
+    }
+    return null;
+  }
+
   ctx.effect(
     () =>
       ctx.tools.register({
@@ -733,50 +862,14 @@ export function apply(ctx) {
         async execute(args) {
           const action = String(args.action ?? "");
           if (!ACTIONS.includes(action)) throw new Error(`chrome: unknown action "${action}"`);
-          if (
-            action === "wait" &&
-            args.selector === undefined &&
-            args.text === undefined &&
-            args.networkIdle !== true &&
-            args.idleMs === undefined
-          ) {
-            // A pure delay needs no extension; selector/text/networkIdle waits must ask the page.
-            const ms = Math.max(0, Math.min(30_000, Number(args.ms ?? 1000)));
-            await sleep(ms);
-            return { text: `waited ${ms}ms` };
+          try {
+            return await runAction(action, args);
+          } catch (error) {
+            const message = String(error && error.message ? error.message : error);
+            noteToolError(action, message);
+            console.warn(`[chrome-bridge] chrome ${action} failed: ${message}`);
+            throw error;
           }
-          if (action === "status") {
-            const status = bridge.status();
-            const state = status.extension === null ? null : await extensionState();
-            return { text: JSON.stringify(statusReport(status, state, connectHint()), null, 2) };
-          }
-          const command = toCommand(action, args);
-          if (!(await waitForExtension(2500))) {
-            return { text: `chrome: ${connectHint()}` };
-          }
-          const outcome = await sendWithRetry(command);
-          const value = outcome.value;
-          if (value === undefined || value === null || value.ok !== true) {
-            return { text: `chrome ${action} failed: ${String(value?.error ?? "no result from the extension")}` };
-          }
-          if (action === "tabs" && (Array.isArray(value.tabs) ? value.tabs.length : 0) === 0) {
-            // "no visible tabs" is misleading when Chrome has no window at all.
-            const state = await extensionState();
-            if (state?.normalWindows === 0) return { text: noWindowTabsText(state) };
-          }
-          if (action === "screenshot") {
-            const saved = saveScreenshot(value.data, value.format ?? command.format ?? "png");
-            return {
-              text: formatResult("screenshot", {
-                ...value,
-                file: saved.file,
-                bytes: saved.bytes,
-                format: saved.format,
-                ...(saved.image === undefined ? {} : { image: saved.image }),
-              }),
-            };
-          }
-          return { text: formatResult(action, value) };
         },
       }),
     "chrome-bridge.tool",
@@ -784,4 +877,4 @@ export function apply(ctx) {
 }
 
 /** Host-side formatting/dispatch helpers exposed for tests. */
-export const __test = { toCommand, formatResult, formatSnapshot, saveScreenshot, imageSize, statusReport, noWindowTabsText };
+export const __test = { toCommand, formatResult, formatSnapshot, saveScreenshot, imageSize, statusReport, noWindowTabsText, windowStateOf, failureText };

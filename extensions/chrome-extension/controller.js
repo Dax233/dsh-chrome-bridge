@@ -727,7 +727,7 @@ export function createChromeController(chromeApi, options = {}) {
       const tabIds = (Array.isArray(tabs) ? tabs : []).map((tab) => tab?.id).filter((id) => typeof id === "number");
       if (tabIds.length === 0) continue;
       try {
-        await chromeApi.tabs.group({ tabIds, groupId: primary.id });
+        await groupTabs({ tabIds, groupId: primary.id });
         merged += 1;
       } catch {
         // Merging is best-effort; grouping the new tab below still proceeds.
@@ -750,7 +750,7 @@ export function createChromeController(chromeApi, options = {}) {
       let groupAction = "reused";
       if (primary !== undefined) {
         try {
-          groupId = await chromeApi.tabs.group({ tabIds: [tabId], groupId: primary.id });
+          groupId = await groupTabs({ tabIds: [tabId], groupId: primary.id });
         } catch {
           // The group can disappear between the query and `tabs.group`; re-read
           // once before creating a new one (creating blindly is how duplicate
@@ -759,14 +759,14 @@ export function createChromeController(chromeApi, options = {}) {
           agentGroupWindowId = undefined;
           const retry = chooseAgentGroup(await allAgentGroups(), targetWindowId);
           if (retry !== undefined) {
-            groupId = await chromeApi.tabs.group({ tabIds: [tabId], groupId: retry.id });
+            groupId = await groupTabs({ tabIds: [tabId], groupId: retry.id });
           } else {
-            groupId = await chromeApi.tabs.group({ tabIds: [tabId] });
+            groupId = await groupTabs({ tabIds: [tabId] });
             groupAction = "created";
           }
         }
       } else {
-        groupId = await chromeApi.tabs.group({ tabIds: [tabId] });
+        groupId = await groupTabs({ tabIds: [tabId] });
         groupAction = "created";
       }
       agentGroupId = groupId;
@@ -1959,31 +1959,92 @@ export function createChromeController(chromeApi, options = {}) {
     };
   }
 
+  function isNoCurrentWindowError(error) {
+    return /no current window/i.test(String(error && error.message ? error.message : error));
+  }
+
+  async function createBrowserWindow(url, active, focus) {
+    const created = await chromeApi.windows.create({ url, focused: focus === true });
+    if (created === null || typeof created !== "object") throw new Error("chrome could not create a browser window");
+    let tab = Array.isArray(created.tabs) ? created.tabs[0] : undefined;
+    if (tab === undefined && typeof created.id === "number" && typeof chromeApi.tabs?.query === "function") {
+      try {
+        const tabs = await chromeApi.tabs.query({ windowId: created.id });
+        tab = Array.isArray(tabs) ? tabs[0] : undefined;
+      } catch {
+        tab = undefined;
+      }
+    }
+    if (typeof tab?.id !== "number") throw new Error(`chrome created a window but did not expose a tab for ${url}`);
+    return tab;
+  }
+
+  /**
+   * `tabs.group` wrapper for a real Chrome 156 quirk: a window created with
+   * `focused:false` cannot have its tabs grouped — the call fails with
+   * "Tabs can only be moved to and from normal windows." until that window has
+   * been activated once. Focus the affected window and retry the same call once.
+   */
+  async function groupTabs(options) {
+    try {
+      return await chromeApi.tabs.group(options);
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      if (!/normal windows/i.test(message) || typeof chromeApi.windows?.update !== "function") throw error;
+      const tabIds = Array.isArray(options?.tabIds) ? options.tabIds : [options?.tabIds];
+      for (const tabId of tabIds) {
+        let tab;
+        try {
+          tab = await chromeApi.tabs.get(tabId);
+        } catch {
+          continue;
+        }
+        if (typeof tab?.windowId !== "number") continue;
+        await chromeApi.windows.update(tab.windowId, { focused: true }).catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return await chromeApi.tabs.group(options);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Create one tab in a real browser window.
+   *
+   * A Chrome process can outlive its last normal window (background mode, or a
+   * process started with `--no-startup-window`); in that state `tabs.create`
+   * rejects with "No current window" and no cached window id would help. So the
+   * window is resolved from scratch each time (never cached): zero normal
+   * windows -> create one, otherwise create the tab and fall back to creating a
+   * window only if the resolved window disappeared in between.
+   */
+  async function openTab(url, active) {
+    const windows = await normalWindows();
+    if (windows.length === 0 && typeof chromeApi.windows?.create === "function") {
+      return { tab: await createBrowserWindow(url, active, true), createdWindow: true };
+    }
+    try {
+      const tab = await chromeApi.tabs.create({ url, active });
+      return { tab, createdWindow: false };
+    } catch (error) {
+      if (!isNoCurrentWindowError(error) || typeof chromeApi.windows?.create !== "function") throw error;
+      return { tab: await createBrowserWindow(url, active, active), createdWindow: true };
+    }
+  }
+
   async function newTab(url, options = {}) {
     const target = toHttpUrl(url);
     const active = options.active === true;
-    let tab;
-    try {
-      tab = await chromeApi.tabs.create({ url: target, active });
-    } catch (error) {
-      // A background Chrome with no window rejects `tabs.create` on some
-      // builds; opening a window explicitly keeps the tool usable there.
-      if (typeof chromeApi.windows?.create !== "function") throw error;
-      const created = await chromeApi.windows.create({ url: target, focused: active });
-      let first = Array.isArray(created?.tabs) ? created.tabs[0] : undefined;
-      if (first === undefined && typeof created?.id === "number" && typeof chromeApi.tabs?.query === "function") {
-        try {
-          const createdTabs = await chromeApi.tabs.query({ windowId: created.id });
-          first = Array.isArray(createdTabs) ? createdTabs[0] : undefined;
-        } catch {
-          first = undefined;
-        }
-      }
-      tab = first;
-      if (typeof tab?.id !== "number") throw error;
-    }
+    const { tab, createdWindow } = await openTab(target, active);
     const grouping = await ensureAgentGroup(tab.id);
-    return { ok: true, tabId: tab?.id, url: target, active, ...grouping };
+    return {
+      ok: true,
+      tabId: tab?.id,
+      url: target,
+      active,
+      ...(createdWindow ? { createdWindow: true } : {}),
+      ...grouping,
+    };
   }
 
   async function closeTab(tabId) {

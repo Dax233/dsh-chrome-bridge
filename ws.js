@@ -226,8 +226,10 @@ export function createExtensionBridge(options) {
 
   function detach(socket, reason) {
     if (client !== undefined && client.socket === socket) {
+      const lastState = client.state;
       client = undefined;
       rejectPending(`chrome extension disconnected (${reason})`);
+      log(`extension disconnected (${reason})${lastState === null ? "" : `; last state: windows=${lastState.normalWindows} tabs=${lastState.tabs} agentGroups=${lastState.agentGroups?.length ?? 0}`}`);
       writeState({ lastDisconnect: reason });
     }
   }
@@ -260,6 +262,19 @@ export function createExtensionBridge(options) {
     }, 100).unref?.();
   }
 
+  /** Store the extension's browser snapshot and log window-count transitions. */
+  function applyState(socket, rawState) {
+    if (client === undefined || client.socket !== socket) return;
+    const previousWindows = client.state?.normalWindows;
+    client.state = sanitizeState(rawState);
+    client.stateAt = Date.now();
+    writeState();
+    const windows = client.state?.normalWindows;
+    if (windows !== undefined && windows !== previousWindows) {
+      log(`browser state: windows=${windows} tabs=${client.state?.tabs ?? "?"} agentGroups=${client.state?.agentGroups?.length ?? 0}`);
+    }
+  }
+
   function handleMessage(socket, text) {
     let message;
     try {
@@ -289,6 +304,7 @@ export function createExtensionBridge(options) {
           state: null,
           stateAt: null,
         };
+        log(`extension connected: ${client.name} v${client.version}`);
         send(socket, { type: "hello-ack", server: "dsh-chrome-bridge", version: 1 });
         writeState();
         return;
@@ -296,11 +312,7 @@ export function createExtensionBridge(options) {
       case "pong": {
         if (client !== undefined && client.socket === socket) {
           client.lastSeen = Date.now();
-          if (message.state !== undefined) {
-            client.state = sanitizeState(message.state);
-            client.stateAt = client.lastSeen;
-            writeState();
-          }
+          if (message.state !== undefined) applyState(socket, message.state);
         }
         return;
       }
@@ -308,9 +320,7 @@ export function createExtensionBridge(options) {
         if (client !== undefined && client.socket === socket) {
           // Any message proves the worker is alive, not only a heartbeat reply.
           client.lastSeen = Date.now();
-          client.state = sanitizeState(message.state);
-          client.stateAt = client.lastSeen;
-          writeState();
+          applyState(socket, message.state);
         }
         return;
       }

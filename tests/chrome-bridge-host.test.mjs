@@ -124,10 +124,17 @@ const NO_WINDOW_STATE = {
 /** Fake Chrome extension: answers CDP-style commands with canned results. */
 function startFakeExtension(port, received, options = {}) {
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ext`);
+  let listTabsCalls = 0;
   const answer = (cmd) => {
     switch (cmd.type) {
-      case "list-tabs":
+      case "list-tabs": {
+        if (Array.isArray(options.tabsSequence)) {
+          const tabs = options.tabsSequence[Math.min(listTabsCalls, options.tabsSequence.length - 1)];
+          listTabsCalls += 1;
+          return { ok: true, tabs };
+        }
         return { ok: true, tabs: options.tabs ?? [{ id: 1, title: "Example Domain", url: "https://example.com/", active: true }] };
+      }
       case "state":
         return { ok: true, ...(options.state ?? DEFAULT_STATE) };
       case "new-tab":
@@ -173,6 +180,7 @@ function startFakeExtension(port, received, options = {}) {
       case "navigate":
         return { ok: true, tabId: cmd.tabId, url: cmd.url, title: "Example Domain" };
       case "snapshot":
+        if (options.snapshot !== undefined) return options.snapshot;
         return {
           ok: true,
           snapshot: {
@@ -350,7 +358,7 @@ test("tabs with zero tabs and no Chrome window explains that Chrome has no windo
   }
 });
 
-test("tabs with zero tabs and an open window keeps the existing no-visible-tabs text", async () => {
+test("tabs with zero tabs but Chrome windows present retries once and reports the stale-worker diagnostic", async () => {
   const harness = makeContext();
   plugin.apply(harness.ctx);
   const received = [];
@@ -360,11 +368,94 @@ test("tabs with zero tabs and an open window keeps the existing no-visible-tabs 
     extension = startFakeExtension(port, received, { tabs: [], state: DEFAULT_STATE });
     await extension.ready;
     const result = await harness.tools[0].execute({ action: "tabs" });
-    assert.equal(result.text, "no visible tabs");
+    assert.match(result.text, /open window\(s\) but the extension listed no tabs/i);
+    assert.match(result.text, /service worker may be stale/i);
+    const listCalls = received.filter((cmd) => cmd.type === "list-tabs").length;
+    assert.equal(listCalls, 2, "an empty list with windows is retried once");
   } finally {
     extension?.socket.close();
     harness.disposeAll();
   }
+});
+
+test("tabs recovers a transiently empty list on the retry", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received, {
+      tabsSequence: [[], [{ id: 3, title: "Recovered", url: "https://example.com/recovered", active: true }]],
+      state: DEFAULT_STATE,
+    });
+    await extension.ready;
+    const result = await harness.tools[0].execute({ action: "tabs" });
+    assert.match(result.text, /id=3 "Recovered"/);
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("failed actions are recorded in status.lastError and formatted with a recovery hint", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received, {
+      snapshot: { ok: false, error: "No tab with given id 999" },
+    });
+    await extension.ready;
+    const failed = await harness.tools[0].execute({ action: "snapshot", tabId: 999 });
+    assert.match(failed.text, /chrome snapshot failed: No tab with given id 999/);
+    assert.match(failed.text, /action=tabs or action=status/);
+    const status = JSON.parse((await harness.tools[0].execute({ action: "status" })).text);
+    assert.equal(status.lastError.action, "snapshot");
+    assert.match(status.lastError.message, /No tab with given id 999/);
+    assert.match(status.lastError.at, /^\d{4}-\d{2}-\d{2}T/);
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("status classifies windowless, no-agent-group, ready and disconnected states", () => {
+  const { statusReport, windowStateOf } = plugin.__test;
+  assert.equal(windowStateOf(null, null), "disconnected");
+  assert.equal(windowStateOf({ name: "ext" }, null), "unknown");
+  assert.equal(windowStateOf({ name: "ext" }, { normalWindows: 0, agentGroups: [] }), "windowless");
+  assert.equal(windowStateOf({ name: "ext" }, { normalWindows: 2, agentGroups: [] }), "no-agent-group");
+  assert.equal(windowStateOf({ name: "ext" }, { normalWindows: 1, agentGroups: [{ id: 1 }] }), "ready");
+
+  const base = { listening: true, port: 47835, pending: 0 };
+  const connected = { ...base, extension: { name: "ext", version: "0.1.32", connectedAt: "a", lastSeenAt: "b", state: null } };
+  const windowless = statusReport(connected, { normalWindows: 0, windows: [], tabs: 0, agentGroups: [] }, "connect", null);
+  assert.equal(windowless.windowState, "windowless");
+  assert.match(windowless.hint, /no open browser window/i);
+  const noGroup = statusReport(connected, { normalWindows: 2, windows: [], tabs: 3, agentGroups: [] }, "connect", null);
+  assert.equal(noGroup.windowState, "no-agent-group");
+  assert.match(noGroup.hint, /no DSH Agent tab group/i);
+  const ready = statusReport(connected, { normalWindows: 1, windows: [], tabs: 2, agentGroups: [{ id: 5 }] }, "connect", null);
+  assert.equal(ready.windowState, "ready");
+  assert.equal(ready.hint, undefined);
+  const error = { at: "2026-11-03T00:00:00.000Z", action: "snapshot", message: "No tab with given id 5" };
+  const withError = statusReport(connected, { normalWindows: 1, windows: [], tabs: 2, agentGroups: [{ id: 5 }] }, "connect", error);
+  assert.deepEqual(withError.lastError, error);
+  const disconnected = statusReport({ ...base, extension: null }, null, "connect", error);
+  assert.equal(disconnected.windowState, "disconnected");
+  assert.equal(disconnected.usableWindows, null);
+  assert.deepEqual(disconnected.lastError, error);
+});
+
+test("failureText maps No current window to the newTab recovery step", () => {
+  const { failureText } = plugin.__test;
+  assert.match(failureText("newTab", "No current window"), /action=newTab creates one automatically/i);
+  assert.match(failureText("snapshot", "tab 42 not found"), /no longer exists/);
+  assert.match(failureText("snapshot", "tab 1 is not in the DSH Agent group; call attach first"), /action=attach/);
+  assert.equal(failureText("tabs", "boom"), "chrome tabs failed: boom");
 });
 
 test("newTab text appends extension group diagnostics", async () => {
@@ -407,6 +498,8 @@ test("formatResult appends group warnings only when the extension reports them",
   assert.doesNotMatch(warned, /saved by Chrome/i);
   const savedOnly = formatResult("newTab", { tabId: 8, grouped: true, groupAction: "created", savedGroupPossible: true });
   assert.match(savedOnly, /saved by Chrome/i);
+  const windowed = formatResult("newTab", { tabId: 9, grouped: true, createdWindow: true });
+  assert.match(windowed, /created a new Chrome window because none was open/);
 });
 
 test("statusReport merges the live snapshot over the stale bridge snapshot", () => {

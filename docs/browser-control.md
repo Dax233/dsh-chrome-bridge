@@ -729,3 +729,68 @@ chrome 桥会重复建组」。以下均为真机复现（Chrome 156，真实用
   windowless 文案、`newTab` 自动开窗并回执 saved warning、扩展 reload 后仍复用同一组、组数量不增长；
   Host 半需重启 DSH 生效（安装副本已同步）。
 - 版本：package.json / manifest / Hello 帧统一 **0.1.31**。
+
+### 34.11 无窗口自愈（「No current window」）与可观测性（2026-11-03，0.1.31 → 0.1.32）
+
+用户（另一 DSH Agent 会话）报告的 bug：Chrome 窗口被关闭/崩溃后，Chrome 进程仍在
+（`chrome.exe --no-startup-window`），扩展仍连接，但 `chrome tabs` 返回空、`chrome newTab` 报
+`No current window`；用 `Start-Process chrome.exe` 拉起“新窗口”后仍然失败，直到重载扩展才恢复。
+以下为逐项复现与结论（Chrome 156，真机）。
+
+**对报告里三个候选根因的修正**
+
+1. 「缓存 windowId 失效」— **不成立**。0.1.30/0.1.31 的代码从不缓存 windowId（`tabs.create` 不传
+   windowId），`windows.create` 也没有缓存路径。真正原因是 Chrome 处于“进程在、零个 normal 窗口”时
+   没有 `current window`：`chrome.tabs.create({url})` 直接抛 `No current window`，和缓存的 id 无关。
+2. 「只枚举 Agent 分组内标签」— **不成立**。`tabs` 一直用 `chrome.tabs.query({})` 列全部标签，分组
+   只作用于动作 ACL；报告里 `tabs: 2` 也证明未分组标签能列出。空列表是因为 `tabs.query` 真的没有窗口。
+3. 「SW 休眠后 windowId 状态陈旧」— **只占很小一部分**。0.1.31 起组与 ACL 都以实时查询为准；真正要
+   补的是**恢复动作本身**的确定性（见下）。
+
+**真机追加发现（两个关键点）**
+
+- **「新窗口」陷阱**：在本机用 `Start-Process chrome.exe` 在后台 Chrome 上拉起窗口时，出现的是
+  **Chrome 的 profile picker**（标题 “Google Chrome”、有焦点，但它是选择用户的窗口，不是浏览器窗口；
+  本机 Chrome 设置「起動時に表示する」开着）。它不会出现在扩展的 `windows.getAll({windowTypes:["normal"]})`
+  里（或没有可驱动标签），所以 `tabs` 仍空；如果顺手点进另一个 profile，桥扩展根本不在那个 profile 里，
+  更会一直“空 + No current window”。这解释了报告步骤 4 的“窗口出现了但依然失败”。
+- **Chrome 156 分组怪癖**：`chrome.windows.create({focused:false})` 创建出来的 normal 窗口，其标签
+  在窗口被激活过一次之前无法分组：`chrome.tabs.group` 报
+  `Tabs can only be moved to and from normal windows.`（即使 `windows.getAll` 报告 type=normal，
+  再等多久也不恢复）。`focused:true` 创建的同款窗口一次就分组成功；对已存在的 `focused:false` 窗口
+  `chrome.windows.update(id,{focused:true})` 后重试即可成功。0.1.31 的窗口恢复路径正好创建的是
+  `focused:false` 窗口，于是“窗口建出来了、组却建不上”，ACL 之后又把它当组外标签。
+
+**0.1.32 修复**
+
+- `newTab` 不再依赖异常：每次实时解析 normal 窗口（零缓存）。0 个窗口 → `windows.create` 创建
+  **focused** 窗口（即恢复窗口），否则 `tabs.create`；只有 `tabs.create` 因窗口在查询后消失而抛
+  `No current window` 时才回退建窗。结果带 `createdWindow:true`，Host 文案注明
+  `[created a new Chrome window because none was open]`。
+- `tabs.group` 统一走 `groupTabs()`：命中 `Tabs can only be moved to and from normal windows.` 时先
+  `windows.update(tab.windowId,{focused:true})`、等 150ms、**原样重试一次**；其他错误照常抛。
+  合并重复组、复用组、建组三条路径都走它。
+- `status` 新增 `windowState`：`disconnected` / `unknown` / `windowless` / `no-agent-group` / `ready`，
+  并分别给 actionable hint（`windowless` 提示 `newTab` 会建窗；`no-agent-group` 提示 `newTab/attach`
+  会建组/入组、旧组可能被 Chrome 存成 saved group）。
+- `status` 新增 `lastError: {at, action, message}`（最近一次失败的工具调用，同时写入
+  `chrome-bridge-state.json`）。失败文案统一做 **recovery hint 映射**：
+  `No current window` → 提示 `newTab` 会自动建窗后重试；`No tab with given id/N not found` → 提示标签
+  已随窗口关闭，先 `tabs/status` 再 `newTab`；`not in the DSH Agent group` → 提示 `attach`。
+- `tabs` 空列表分诊：无窗口 → windowless 文案；**有窗口但列表为空** → 自动重试一次 list-tabs，仍空则
+  返回「Chrome 报告 N 个窗口但扩展列不出标签，worker 可能陈旧」的诊断（并记 lastError）。
+- 可观测性：扩展在 connect/disconnect、窗口数 0↔N 变化时写 `console` 日志（含时间、窗口数、组数）；
+  Host `ws.js` 在 hello/disconnect/窗口数变化时各写一行 `[chrome-bridge]` 日志。
+- 版本 0.1.32（package.json / manifest / Hello 帧）；Host 半需重启 DSH 生效。
+
+**测试与真机验证**
+
+- controller 新增：零窗口 newTab 建窗+分组（断言 `focused:true`）、tabs.create 失去窗口时回退、
+  非 `No current window` 错误不被吞、`Tabs can only be moved...` 分组怪癖的 focus+retry；
+  host 新增：`windowState` 四态、`lastError` 记录/输出、失败文案 hint 映射、空 tabs 两分支与重试成功、
+  `[created a new Chrome window...]` 文案。全套 **119 项全绿**（基线 111）。
+- 真机（0.1.32 扩展 + 0.1.31 Host）：保留 DevTools 窗口、关掉所有 normal 窗口 → `status` 报
+  `normalWindows:0/usableWindows:0` + hint；`newTab` 成功创建 focused 窗口并把标签放进新的
+  “DSH Agent” 组（0.1.32 前同场景分组失败，`attach` 回执 `grouping failed: Tabs can only be moved...`）；
+  `snapshot` 在该恢复窗口的标签上正常。
+- Host 0.1.32 的 status/lastError/hint 由单测覆盖（真机 Host 需重启 DSH 后生效）。

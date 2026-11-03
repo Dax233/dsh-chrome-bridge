@@ -125,6 +125,23 @@ function makeChromeMock() {
         if (window === undefined) throw new Error(`No window with id: ${windowId}`);
         return { ...window };
       },
+      async update(windowId, properties) {
+        calls.push({ method: "windows.update", windowId, properties });
+        const window = (state.windows ?? []).find((entry) => entry.id === windowId);
+        if (window !== undefined) Object.assign(window, properties);
+        return window === undefined ? undefined : { ...window };
+      },
+      async create(properties) {
+        calls.push({ method: "windows.create", properties });
+        const id = state.nextWindowId ?? 2;
+        const tabId = state.nextTabId ?? 42;
+        state.tabGroupByTab[tabId] = -1;
+        if (state.createWindowAddsToList !== false) {
+          state.windows = [...(state.windows ?? []), { id, type: "normal", focused: properties?.focused === true }];
+          state.windowId = id;
+        }
+        return { id, focused: properties?.focused === true, tabs: [{ id: tabId, windowId: id, url: properties?.url }] };
+      },
     },
     debugger: {
       onEvent: {
@@ -314,6 +331,75 @@ test("newTab creates a background tab by default and reports its id", async () =
   assert.equal(result.tabId, 42);
   const create = calls.find((call) => call.method === "tabs.create");
   assert.deepEqual(create.properties, { url: "https://example.com/", active: false });
+  assert.equal(result.createdWindow, undefined, "an existing window means no extra window is created");
+});
+
+test("newTab opens a Chrome window when the process has no normal window", async () => {
+  const { chromeApi, state, calls } = makeChromeMock();
+  state.windows = []; // Chrome alive in background with no window (e.g. --no-startup-window)
+  chromeApi.tabs.create = async () => {
+    throw new Error("No current window");
+  };
+  const controller = createChromeController(chromeApi);
+  const result = await controller.newTab("https://example.com/windowless");
+  assert.equal(result.ok, true);
+  assert.equal(result.createdWindow, true);
+  assert.equal(result.grouped, true);
+  const created = calls.find((call) => call.method === "windows.create");
+  assert.ok(created, "the controller must create a browser window instead of failing");
+  // Recovery creates a focused window: Chrome refuses to group tabs of a window
+  // created unfocused ("Tabs can only be moved to and from normal windows.").
+  assert.deepEqual(created.properties, { url: "https://example.com/windowless", focused: true });
+  assert.equal(state.groups.length, 1, "the new tab is grouped in the created window");
+});
+
+test("newTab falls back to windows.create when tabs.create loses the current window", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  let attempts = 0;
+  chromeApi.tabs.create = async () => {
+    attempts += 1;
+    throw new Error("No current window");
+  };
+  const controller = createChromeController(chromeApi);
+  const result = await controller.newTab("https://example.com/race");
+  assert.equal(result.ok, true);
+  assert.equal(result.createdWindow, true);
+  assert.equal(attempts, 1);
+  assert.ok(calls.some((call) => call.method === "windows.create"));
+});
+
+test("newTab does not hide unrelated tab creation errors", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  chromeApi.tabs.create = async () => {
+    throw new Error("boom: tab creation rejected");
+  };
+  const controller = createChromeController(chromeApi);
+  const result = await controller.execute({ type: "new-tab", url: "https://example.com/broken" });
+  assert.equal(result.ok, false);
+  assert.match(String(result.error), /boom: tab creation rejected/);
+  assert.equal(calls.some((call) => call.method === "windows.create"), false);
+});
+
+test("grouping retries after focusing a window created unfocused (Chrome 156 quirk)", async () => {
+  const { chromeApi, calls } = makeChromeMock();
+  const realGroup = chromeApi.tabs.group.bind(chromeApi.tabs);
+  let failures = 1;
+  chromeApi.tabs.group = async (options) => {
+    if (failures > 0) {
+      failures -= 1;
+      throw new Error("Tabs can only be moved to and from normal windows.");
+    }
+    return realGroup(options);
+  };
+  const controller = createChromeController(chromeApi);
+  const result = await controller.newTab("https://example.com/unfocused-window");
+  assert.equal(result.ok, true);
+  assert.equal(result.grouped, true);
+  assert.equal(failures, 0, "the quirk error was retried once");
+  assert.ok(
+    calls.some((call) => call.method === "windows.update" && call.properties?.focused === true),
+    "the affected window must be focused before retrying tabs.group",
+  );
 });
 
 test("closeTab removes the tab", async () => {

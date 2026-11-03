@@ -35,7 +35,8 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 安全/行为要点：
 
 - 只有 **DSH Agent 标签组** 内的 tab 可被驱动；`newTab` 自动入组，`attach` 是显式 opt-in（用户把 tab 拖出组即撤销）。
-- **连接 ≠ 可用**：Chrome 关掉最后一个窗口后台进程仍在时，WebSocket/心跳还活着。`status` 的 `usableWindows` 与扩展 state（`normalWindows/windows/tabs/agentGroups/savedGroupPossible`）会指出“已连接但没有窗口”，`tabs` 也会返回 windowless 文案；`newTab` 会让 Chrome 自动开窗。
+- **连接 ≠ 可用**：Chrome 关掉最后一个窗口后台进程仍在时，WebSocket/心跳还活着。`status` 的 `usableWindows`、`windowState`（`disconnected`/`unknown`/`windowless`/`no-agent-group`/`ready`）、`lastError` 与扩展 state（`normalWindows/windows/tabs/agentGroups/savedGroupPossible`）会指出“已连接但没有窗口/没有 Agent 组”，`tabs` 也会返回 windowless 文案并在“有窗口但列不出标签”时自动重试+诊断。
+- **无窗口自愈**：`newTab` 不再依赖 `current window`——每次实时解析 normal 窗口，零窗口时直接 `windows.create` 一个**聚焦**窗口（Chrome 156 对 `focused:false` 窗口的标签会拒绝分组），再建标签入组；`tabs.group` 命中 `Tabs can only be moved to and from normal windows.` 时先聚焦该窗口再重试一次。回执会注明 `[created a new Chrome window because none was open]`。
 - **组只复用、不盲目新建**：每次 `newTab/attach` 先实时查询所有打开的 “DSH Agent” 组（优先同窗口），失败时重查一次再决定是否建组；同一窗口的重复组会自动合并，回执带 `groupAction: created|reused` 与 `groupsMerged`。
 - 快照使用 Host 侧 `n<backendNodeId>` refs；动作带 settle/回执。
 - `logs` 支持 `filter`/`clear`；`wait` 支持 selector/text/networkIdle/idleMs/ms（多条件 AND）；`upload` 用 `DOM.setFileInputFiles`。
@@ -67,6 +68,9 @@ Chrome 会在**窗口关闭时把带标题的标签组存为 saved tab group**�
   此时 `newTab/attach` 回执会带 `savedGroupPossible:true` 的 warning，`status.note` 也会提示去书签栏处理。
 - 用户从书签栏重新打开旧 saved 组、与新建组同时存在时，桥会把**同一窗口**内的重复组自动合并（回执
   `groupsMerged>0`）；不同窗口的同名组会保留，但 ACL 接受任意一个打开的 “DSH Agent” 组。
+- **不要用 `Start-Process chrome.exe` 当“开窗恢复”**：本机 Chrome 开着「起動時に表示する」时它只会弹
+  profile picker（标题也叫 “Google Chrome”，但不是可驱动的浏览器窗口；选错 profile 时桥扩展甚至不在
+  那个 profile 里）。恢复请直接用 `chrome newTab`，桥会自己创建 focused 窗口。
 - 想彻底避免历史 saved 条目，只能在 Chrome 里手动关闭/删除（或在关窗前把 agent tab 移出组）。
 
 ## 开发
@@ -75,7 +79,7 @@ Chrome 会在**窗口关闭时把带标题的标签组存为 saved tab group**�
 npm test
 ```
 
-测试覆盖 WebSocket 握手/安全与状态快照、Host 工具往返与 status/窗口诊断、扩展 controller（含组复用/合并/ACL、截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
+测试覆盖 WebSocket 握手/安全与状态快照、Host 工具往返与 status/窗口诊断（windowState/lastError/失败 hint/空 tabs 重试）、扩展 controller（含无窗口自愈、组复用/合并/ACL、Chrome 156 分组怪癖重试、截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
 
 ## License
 

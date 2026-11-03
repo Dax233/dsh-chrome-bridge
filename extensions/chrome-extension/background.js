@@ -15,11 +15,22 @@ let socket = null;
 let reconnectTimer = null;
 let attempt = 0;
 let stopped = false;
+let lastNormalWindows;
 
 const controller = createChromeController(chrome, {
   // Window/tab-group changes invalidate the Host's picture of the browser, so
   // push it proactively instead of waiting for the next heartbeat.
   onStateChange: (state) => {
+    const windows = typeof state?.normalWindows === "number" ? state.normalWindows : undefined;
+    if (windows !== undefined && windows !== lastNormalWindows) {
+      const groups = Array.isArray(state?.agentGroups) ? state.agentGroups.length : 0;
+      if (windows === 0) {
+        console.warn(`[dsh-chrome-bridge] no normal Chrome window (groups=${groups}); newTab will create one`);
+      } else {
+        console.info(`[dsh-chrome-bridge] browser windows=${windows} tabs=${state?.tabs ?? "?"} agentGroups=${groups}`);
+      }
+      lastNormalWindows = windows;
+    }
     try {
       socket?.send(JSON.stringify({ type: "state", at: Date.now(), state }));
     } catch {
@@ -57,9 +68,11 @@ async function connect() {
   socket = ws;
   ws.addEventListener("open", () => {
     attempt = 0;
+    lastNormalWindows = undefined;
+    console.info(`[dsh-chrome-bridge] connected to Host (ws://127.0.0.1:${port}/ext)`);
     try {
       // The token is a handshake field, not a URL query: URLs leak into logs.
-      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.31", token }));
+      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.32", token }));
     } catch {
       // The close handler will reconnect.
     }
@@ -112,8 +125,10 @@ async function connect() {
         });
     })();
   });
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (event) => {
     if (socket === ws) socket = null;
+    const code = typeof event?.code === "number" ? event.code : "?";
+    console.warn(`[dsh-chrome-bridge] host connection closed (code ${code}); retrying`);
     scheduleReconnect();
   });
   ws.addEventListener("error", () => {
