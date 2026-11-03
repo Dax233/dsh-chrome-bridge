@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -260,6 +260,17 @@ async function waitForPort(tool) {
   }
   throw new Error("chrome bridge did not start");
 }
+
+test("package.json ships every local module the Host imports", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const packageJson = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"));
+  const indexSource = readFileSync(join(here, "..", "index.js"), "utf8");
+  const localModules = [...indexSource.matchAll(/from\s+"\.\/([^"]+)"/gu)].map((match) => match[1]);
+  assert.ok(localModules.includes("ws.js"), "index.js must import ws.js");
+  for (const file of localModules) {
+    assert.ok(packageJson.files.includes(file), `package.json files must list ${file} (git/github installs pack only these)`);
+  }
+});
 
 test("host apply() is synchronous and registers the chrome tool", () => {
   const harness = makeContext();
