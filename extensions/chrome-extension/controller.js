@@ -806,6 +806,25 @@ export function createChromeController(chromeApi, options = {}) {
     return chromeApi.debugger.sendCommand({ tabId }, method, params);
   }
 
+  /**
+   * CDP calls that can never settle (some DOM queries on closed-shadow or
+   * detached nodes hang instead of rejecting) would block the command queue
+   * forever. Race them with a budget so the queue always advances.
+   */
+  async function sendBounded(tabId, method, params = {}, timeoutMs = 3000) {
+    let timer;
+    try {
+      return await Promise.race([
+        send(tabId, method, params),
+        new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`${method} did not answer within ${timeoutMs}ms`)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   async function evaluate(tabId, expression) {
     const response = await send(tabId, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
     if (response?.exceptionDetails) throw new Error(String(response.exceptionDetails.text ?? "page evaluation failed"));
@@ -987,10 +1006,10 @@ export function createChromeController(chromeApi, options = {}) {
       let resolvable;
       try {
         await send(tabId, "DOM.enable").catch(() => {});
-        await send(tabId, "DOM.getDocument", { depth: 0 }).catch(() => {});
+        await sendBounded(tabId, "DOM.getDocument", { depth: 0 }).catch(() => {});
         if (candidates.length > 0) {
           const ids = candidates.map((candidate) => candidate.backendDOMNodeId);
-          const pushed = await send(tabId, "DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: ids });
+          const pushed = await sendBounded(tabId, "DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: ids }, 3000);
           if (Array.isArray(pushed?.nodeIds) && pushed.nodeIds.length === ids.length) {
             const kept = [];
             for (let index = 0; index < ids.length; index += 1) {
@@ -1005,9 +1024,50 @@ export function createChromeController(chromeApi, options = {}) {
       } catch {
         resolvable = undefined;
       }
-      const usable = resolvable !== undefined && resolvable.size > 0
+      const resolvedUsable = resolvable !== undefined && resolvable.size > 0
         ? candidates.filter((candidate) => resolvable.has(candidate.backendDOMNodeId))
         : candidates;
+      // Shadow-DOM rescue: closed shadow content is invisible to page JS and
+      // Chrome marks its generic containers "ignored" in the AX tree, so the
+      // accessibility filters above drop clickable <div>s entirely. Walk the DOM
+      // once (pierce) and surface closed-shadow elements that carry text or an
+      // aria-label/title/placeholder, marked [shadow: closed].
+      const shadowUsable = [];
+      let shadowIds = null;
+      try {
+        const index = await domIndex(tabId);
+        if (index !== undefined) {
+          shadowIds = new Set();
+          for (const entry of index.nodes.values()) if (entry.shadow === "closed") shadowIds.add(entry.backendNodeId);
+          const usableIds = new Set(resolvedUsable.map((candidate) => candidate.backendDOMNodeId));
+          const rescued = [];
+          for (const entry of index.nodes.values()) {
+            if (entry.shadow !== "closed") continue;
+            if (usableIds.has(entry.backendNodeId)) continue;
+            if (["script", "style", "template", "noscript", "head", "meta", "link", "title"].includes(entry.tag)) continue;
+            const label = [entry.ownText, entry.attributes["aria-label"], entry.attributes.title, entry.attributes.placeholder]
+              .find((value) => typeof value === "string" && value.trim() !== "");
+            if (label === undefined) continue;
+            rescued.push({ entry, label: label.replace(/\s+/g, " ").trim().slice(0, 100) });
+          }
+          rescued.sort((left, right) => right.entry.depth - left.entry.depth);
+          for (const { entry, label } of rescued.slice(0, 20)) {
+            shadowUsable.push({
+              key: `shadow:${entry.backendNodeId}`,
+              parentKey: "",
+              frameId: undefined,
+              backendDOMNodeId: entry.backendNodeId,
+              role: "generic",
+              text: label,
+              depth: 1,
+              shadow: "closed",
+            });
+          }
+        }
+      } catch {
+        shadowUsable.length = 0;
+      }
+      const usable = [...resolvedUsable, ...shadowUsable];
       const keptKeys = new Set(usable.map((candidate) => candidate.key));
       const byKey = new Map(candidates.map((candidate) => [candidate.key, candidate]));
       const depthOf = (candidate) => {
@@ -1026,12 +1086,18 @@ export function createChromeController(chromeApi, options = {}) {
         : [...mainUsable.slice(0, 120), ...childUsable.slice(0, 30)].slice(0, 150);
       const elements = chosen.map((candidate) => {
         const inChildFrame = candidate.frameId !== undefined && mainFrameId !== undefined && candidate.frameId !== mainFrameId;
+        const closedShadow = shadowIds !== null && shadowIds.has(candidate.backendDOMNodeId);
         return {
           ref: `n${candidate.backendDOMNodeId}`,
           role: candidate.role,
           text: candidate.text,
           ...(candidate.value === undefined ? {} : { value: candidate.value }),
           ...(candidate.checked === true ? { checked: true } : {}),
+          ...(closedShadow
+            ? { shadow: "closed" }
+            : candidate.shadow === undefined
+              ? {}
+              : { shadow: candidate.shadow }),
           ...(inChildFrame ? { frame: candidate.frameId } : {}),
           depth: depthOf(candidate),
         };
@@ -1044,6 +1110,7 @@ export function createChromeController(chromeApi, options = {}) {
         elements,
         frames,
         omitted: usable.length - elements.length,
+        shadowElements: elements.filter((element) => element.shadow === "closed").length,
         skipped,
         ...(viewport === undefined ? {} : { viewport }),
       };
@@ -1051,57 +1118,339 @@ export function createChromeController(chromeApi, options = {}) {
       return undefined;
     }
   }
+  /** Flat CDP attribute array -> name/value map. */
+  function attributeMap(attributes) {
+    const map = {};
+    if (!Array.isArray(attributes)) return map;
+    for (let index = 0; index + 1 < attributes.length; index += 2) map[String(attributes[index])] = String(attributes[index + 1]);
+    return map;
+  }
+
+  /**
+   * Whole-page DOM index including author shadow roots (`pierce: true`), so a
+   * closed shadow root is searchable even though page JS cannot reach it.
+   * Bounded to a sane node count; returns undefined when the DOM is unavailable.
+   */
+  async function domIndex(tabId) {
+    await send(tabId, "DOM.enable").catch(() => {});
+    let document;
+    try {
+      document = await sendBounded(tabId, "DOM.getDocument", { depth: -1, pierce: true }, 8000);
+    } catch {
+      return undefined;
+    }
+    const root = document?.root;
+    if (root === undefined || root === null) return undefined;
+    const skipTags = new Set(["script", "style", "head", "meta", "link", "noscript", "template", "title"]);
+    const nodes = new Map();
+    const shadowRoots = { open: 0, closed: 0 };
+    const walk = (node, shadow, depth) => {
+      if (node === null || typeof node !== "object" || nodes.size >= 20000) return;
+      if (node.nodeType === 1) {
+        const direct = [];
+        for (const child of Array.isArray(node.children) ? node.children : []) {
+          if (child?.nodeType === 3 && typeof child.nodeValue === "string") direct.push(child.nodeValue);
+        }
+        nodes.set(node.backendNodeId, {
+          backendNodeId: node.backendNodeId,
+          nodeId: node.nodeId,
+          tag: String(node.nodeName ?? "").toLowerCase(),
+          attributes: attributeMap(node.attributes),
+          ownText: direct.join(" ").replace(/\s+/g, " ").trim(),
+          shadow,
+          depth,
+          children: (Array.isArray(node.children) ? node.children : []).map((child) => child?.backendNodeId).filter((id) => typeof id === "number"),
+        });
+      }
+      for (const child of Array.isArray(node.children) ? node.children : []) walk(child, shadow, depth + 1);
+      for (const shadowRoot of Array.isArray(node.shadowRoots) ? node.shadowRoots : []) {
+        const type = shadowRoot?.shadowRootType;
+        if (type === "user-agent") continue;
+        shadowRoots[type === "closed" ? "closed" : "open"] += 1;
+        walk(shadowRoot, type === "closed" || shadow === "closed" ? "closed" : "open", depth + 1);
+      }
+      if (node.contentDocument !== undefined && node.contentDocument !== null) walk(node.contentDocument, shadow, depth + 1);
+    };
+    walk(root, undefined, 0);
+    return { nodes, shadowRoots, skipTags };
+  }
+
+  /** Aggregated text for a DOM index entry, bounded so huge containers stay cheap. */
+  function domEntryText(entry, index) {
+    if (entry === undefined) return "";
+    let text = entry.ownText;
+    if (text !== "") return text;
+    const queue = [...entry.children];
+    let visited = 0;
+    while (queue.length > 0 && visited < 400 && text.length < 160) {
+      visited += 1;
+      const child = index.nodes.get(queue.shift());
+      if (child === undefined) continue;
+      if (child.ownText !== "") text = `${text} ${child.ownText}`.trim();
+      queue.push(...child.children);
+    }
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  /** Content-box rect + center via CDP box model (accepts backendNodeId, so closed shadow works). */
+  async function boxModelRect(tabId, backendNodeId) {
+    try {
+      await sendBounded(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId }, 1500).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const model = await sendBounded(tabId, "DOM.getBoxModel", { backendNodeId }, 2500);
+      const quad = model?.model?.content ?? model?.model?.border ?? model?.content;
+      if (!Array.isArray(quad) || quad.length < 8) return undefined;
+      const xs = [quad[0], quad[2], quad[4], quad[6]];
+      const ys = [quad[1], quad[3], quad[5], quad[7]];
+      const x = Math.round(Math.min(...xs));
+      const y = Math.round(Math.min(...ys));
+      const width = Math.round(Math.max(...xs) - Math.min(...xs));
+      const height = Math.round(Math.max(...ys) - Math.min(...ys));
+      if (width <= 0 || height <= 0) return undefined;
+      return { rect: { x, y, width, height }, center: { x: Math.round(x + width / 2), y: Math.round(y + height / 2) } };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Closed shadow content is not reachable from page JS: DOM.resolveNode fails
+   * even though the node exists in the DOM tree. That failure is our cheapest
+   * "is inside a closed shadow root" signal.
+   */
+  async function isClosedShadowNode(tabId, backendNodeId) {
+    try {
+      const resolved = await sendBounded(tabId, "DOM.resolveNode", { backendNodeId }, 1500);
+      return typeof resolved?.objectId !== "string";
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Page-structure search: text / tag / (light-DOM) selector -> actionable refs
+   * with rects, including closed shadow DOM. This is the escape hatch when the
+   * accessibility snapshot filters an element out (e.g. a clickable <div> in a
+   * closed shadow root, or an unnamed shadow button).
+   */
+  async function find(tabId, input = {}) {
+    const id = tabIdOf(tabId);
+    await assertAgentTab(id);
+    await ensureAttached(id);
+    const text = typeof input.text === "string" ? input.text.trim() : "";
+    const tag = typeof input.tag === "string" ? input.tag.trim().toLowerCase() : "";
+    const selector = typeof input.selector === "string" ? input.selector.trim() : "";
+    if (text === "" && tag === "" && selector === "") throw new Error("find requires text, tag or selector");
+    const limit = Math.max(1, Math.min(50, Number(input.limit ?? 20) || 20));
+    const index = await domIndex(id);
+    if (index === undefined) throw new Error("could not read the page DOM for this tab");
+    let selectorBackendIds = new Set();
+    if (selector !== "") {
+      try {
+        const root = await send(id, "DOM.getDocument", { depth: 0 });
+        const nodeId = root?.root?.nodeId;
+        if (typeof nodeId === "number") {
+          const found = await sendBounded(id, "DOM.querySelectorAll", { nodeId, selector }, 3000);
+          for (const foundId of Array.isArray(found?.nodeIds) ? found.nodeIds : []) {
+            const described = await sendBounded(id, "DOM.describeNode", { nodeId: foundId }, 3000);
+            const backendId = described?.node?.backendNodeId;
+            if (typeof backendId === "number") selectorBackendIds.add(backendId);
+          }
+        }
+      } catch {
+        selectorBackendIds = new Set();
+      }
+    }
+    const accessible = new Map();
+    try {
+      const tree = await send(id, "Accessibility.getFullAXTree");
+      for (const node of Array.isArray(tree?.nodes) ? tree.nodes : []) {
+        if (typeof node?.backendDOMNodeId !== "number") continue;
+        accessible.set(node.backendDOMNodeId, {
+          role: String(node?.role?.value ?? ""),
+          name: String(node?.name?.value ?? ""),
+          ignored: node?.ignored === true,
+        });
+      }
+    } catch {
+      // Accessibility is optional enrichment for `find`.
+    }
+    const wanted = text.toLowerCase();
+    const matches = [];
+    for (const entry of index.nodes.values()) {
+      if (index.skipTags.has(entry.tag)) continue;
+      let match;
+      if (selector !== "" && selectorBackendIds.has(entry.backendNodeId)) match = "selector";
+      else if (tag !== "" && entry.tag === tag) match = "tag";
+      else if (wanted !== "") {
+        const values = [
+          entry.ownText,
+          entry.attributes["aria-label"],
+          entry.attributes.title,
+          entry.attributes.placeholder,
+          entry.attributes.alt,
+          accessible.get(entry.backendNodeId)?.name,
+        ]
+          .filter((value) => typeof value === "string" && value !== "")
+          .map((value) => value.toLowerCase());
+        if (values.some((value) => value.includes(wanted))) match = "text";
+      }
+      if (match === undefined) continue;
+      matches.push({ entry, match });
+      if (matches.length >= limit * 6) break;
+    }
+    // Fall back to aggregated text when no element owns the text directly (nested spans).
+    if (wanted !== "" && matches.length === 0) {
+      for (const entry of index.nodes.values()) {
+        if (index.skipTags.has(entry.tag)) continue;
+        if (domEntryText(entry, index).toLowerCase().includes(wanted)) {
+          matches.push({ entry, match: "text-descendant" });
+          if (matches.length >= limit * 6) break;
+        }
+      }
+    }
+    matches.sort((left, right) => right.entry.depth - left.entry.depth);
+    const results = [];
+    for (const { entry, match } of matches) {
+      if (results.length >= limit) break;
+      const rect = await boxModelRect(id, entry.backendNodeId);
+      if (rect === undefined && matches.length > 1) continue;
+      const ax = accessible.get(entry.backendNodeId);
+      results.push({
+        ref: `n${entry.backendNodeId}`,
+        tag: entry.tag,
+        ...(ax === undefined || ax.role === "" ? {} : { role: ax.role }),
+        ...(ax === undefined || ax.name === "" ? {} : { name: ax.name }),
+        text: (entry.ownText || domEntryText(entry, index) || ax?.name || "").slice(0, 120) || undefined,
+        ...(rect === undefined ? {} : { rect: rect.rect, center: rect.center }),
+        shadow: entry.shadow ?? "none",
+        match,
+      });
+    }
+    const refs = new Map(refsByTab.get(id) ?? []);
+    for (const result of results) {
+      refs.set(result.ref, {
+        backendDOMNodeId: Number(result.ref.slice(1)),
+        role: result.role ?? result.tag,
+        text: result.name ?? result.text ?? result.tag,
+        ...(result.shadow === "closed" ? { shadow: "closed" } : {}),
+      });
+    }
+    refsByTab.set(id, refs);
+    return {
+      ok: true,
+      tabId: id,
+      scanned: index.nodes.size,
+      shadowRoots: index.shadowRoots,
+      matches: results,
+      ...(results.length === 0
+        ? {
+            hint: "no match; closed shadow content is only visible to the accessibility/DOM tree, so check the exact text/tag or take action=snapshot",
+          }
+        : {}),
+    };
+  }
+
   async function axNodeId(tabId, backendNodeId) {
     // DOM.pushNodesByBackendIdsToFrontend answers "Document needs to be
     // requested first" until this tab target has a current DOM document.
     await send(tabId, "DOM.enable").catch(() => {});
     await send(tabId, "DOM.getDocument", { depth: 0 }).catch(() => {});
-    const pushed = await send(tabId, "DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: [backendNodeId] });
+    const pushed = await sendBounded(tabId, "DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: [backendNodeId] }, 3000);
     const nodeId = pushed?.nodeIds?.[0];
     if (typeof nodeId !== "number") throw new Error("element ref is stale (the page changed); take a new snapshot");
     return nodeId;
   }
 
-  async function axBox(tabId, backendNodeId) {
-    const nodeId = await axNodeId(tabId, backendNodeId);
-    try {
-      await send(tabId, "DOM.scrollIntoViewIfNeeded", { nodeId });
-    } catch {
-      // Not every node is scrollable; getBoxModel still reports its position.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    const model = await send(tabId, "DOM.getBoxModel", { nodeId });
-    const quad = model?.model?.content ?? model?.content;
-    if (!Array.isArray(quad) || quad.length < 8) throw new Error("could not measure the element; take a new snapshot");
+  function boxCenter(model) {
+    const quad = model?.model?.content ?? model?.model?.border ?? model?.content ?? model?.border;
+    if (!Array.isArray(quad) || quad.length < 8) return undefined;
     const xs = [quad[0], quad[2], quad[4], quad[6]];
     const ys = [quad[1], quad[3], quad[5], quad[7]];
-    const x = Math.round((Math.min(...xs) + Math.max(...xs)) / 2);
-    const y = Math.round((Math.min(...ys) + Math.max(...ys)) / 2);
+    return { x: Math.round((Math.min(...xs) + Math.max(...xs)) / 2), y: Math.round((Math.min(...ys) + Math.max(...ys)) / 2) };
+  }
+
+  async function axBox(tabId, backendNodeId) {
+    let nodeId;
+    try {
+      nodeId = await axNodeId(tabId, backendNodeId);
+    } catch {
+      nodeId = undefined;
+    }
+    if (nodeId !== undefined) {
+      try {
+        await sendBounded(tabId, "DOM.scrollIntoViewIfNeeded", { nodeId }, 1500).catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        const model = await sendBounded(tabId, "DOM.getBoxModel", { nodeId }, 2500);
+        const point = boxCenter(model);
+        if (point !== undefined) return await withHitTest(tabId, point, backendNodeId);
+      } catch {
+        // Fall through to the backendNodeId form: closed-shadow nodes are not
+        // always pushable to a front-end node id.
+      }
+    }
+    await sendBounded(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId }, 1500).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const model = await sendBounded(tabId, "DOM.getBoxModel", { backendNodeId }, 2500);
+    const point = boxCenter(model);
+    if (point === undefined) throw new Error("could not measure the element; take a new snapshot");
+    return await withHitTest(tabId, point, backendNodeId);
+  }
+
+  async function withHitTest(tabId, point, backendNodeId) {
     let hitTrusted;
     try {
-      const hit = await send(tabId, "DOM.getNodeForLocation", { x, y });
+      const hit = await send(tabId, "DOM.getNodeForLocation", { x: point.x, y: point.y });
       hitTrusted = hit?.backendNodeId === backendNodeId;
     } catch {
       hitTrusted = undefined;
     }
-    return { x, y, hitTrusted };
+    return { x: point.x, y: point.y, hitTrusted };
   }
 
   async function axFocus(tabId, backendNodeId) {
-    const nodeId = await axNodeId(tabId, backendNodeId);
-    const resolved = await send(tabId, "DOM.resolveNode", { nodeId });
-    if (typeof resolved?.objectId !== "string") throw new Error("could not resolve the element; take a new snapshot");
-    await send(tabId, "Runtime.callFunctionOn", {
-      objectId: resolved.objectId,
-      functionDeclaration: "function(){ this.focus(); if (typeof this.select === 'function') this.select(); }",
-      returnByValue: true,
-    });
+    let objectId;
+    try {
+      const direct = await sendBounded(tabId, "DOM.resolveNode", { backendNodeId }, 1500);
+      if (typeof direct?.objectId === "string") objectId = direct.objectId;
+    } catch {
+      objectId = undefined;
+    }
+    if (objectId === undefined) {
+      try {
+        const nodeId = await axNodeId(tabId, backendNodeId);
+        const resolved = await sendBounded(tabId, "DOM.resolveNode", { nodeId }, 1500);
+        if (typeof resolved?.objectId === "string") objectId = resolved.objectId;
+      } catch {
+        objectId = undefined;
+      }
+    }
+    if (objectId === undefined) {
+      // Closed shadow content is unreachable from page JS; a real click at the
+      // element's center still focuses the internal control.
+      const point = await axBox(tabId, backendNodeId);
+      await send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1 });
+      await send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1 });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return { method: "coordinate" };
+    }
+    await sendBounded(
+      tabId,
+      "Runtime.callFunctionOn",
+      {
+        objectId,
+        functionDeclaration: "function(){ this.focus(); if (typeof this.select === 'function') this.select(); }",
+        returnByValue: true,
+      },
+      2500,
+    );
+    return { method: "script" };
   }
 
   async function axScriptClick(tabId, backendNodeId) {
     let objectId;
     try {
-      const direct = await send(tabId, "DOM.resolveNode", { backendNodeId });
+      const direct = await sendBounded(tabId, "DOM.resolveNode", { backendNodeId }, 1500);
       if (typeof direct?.objectId === "string") objectId = direct.objectId;
     } catch {
       objectId = undefined;
@@ -1109,15 +1458,20 @@ export function createChromeController(chromeApi, options = {}) {
     if (objectId === undefined) {
       // Same-process frames sometimes only resolve through a pushed nodeId.
       const nodeId = await axNodeId(tabId, backendNodeId);
-      const resolved = await send(tabId, "DOM.resolveNode", { nodeId });
+      const resolved = await sendBounded(tabId, "DOM.resolveNode", { nodeId }, 1500);
       if (typeof resolved?.objectId !== "string") throw new Error("could not resolve the element; take a new snapshot");
       objectId = resolved.objectId;
     }
-    await send(tabId, "Runtime.callFunctionOn", {
-      objectId,
-      functionDeclaration: "function(){ this.click(); }",
-      returnByValue: true,
-    });
+    await sendBounded(
+      tabId,
+      "Runtime.callFunctionOn",
+      {
+        objectId,
+        functionDeclaration: "function(){ this.click(); }",
+        returnByValue: true,
+      },
+      2500,
+    );
   }
 
   async function frameScriptClick(tabId, frameId, text) {
@@ -1221,6 +1575,7 @@ export function createChromeController(chromeApi, options = {}) {
           backendDOMNodeId: Number(element.ref.slice(1)),
           role: element.role,
           text: element.text,
+          ...(element.shadow === undefined ? {} : { shadow: element.shadow }),
           ...(frameId === undefined ? {} : { frameId, offset: frames[frameId] ?? { x: 0, y: 0 } }),
         });
       }
@@ -1355,11 +1710,17 @@ export function createChromeController(chromeApi, options = {}) {
     await assertAgentTab(id);
     await ensureAttached(id);
     const text = String(input.text ?? "");
+    let closedShadowRef = false;
     if (input.ref !== undefined && input.ref !== null) {
       const ref = String(input.ref);
       const axInfo = refsByTab.get(id)?.get(ref);
       if (axInfo !== undefined) {
-        await axFocus(id, axInfo.backendDOMNodeId);
+        closedShadowRef = axInfo.shadow === "closed" || (await isClosedShadowNode(id, axInfo.backendDOMNodeId));
+        try {
+          await axFocus(id, axInfo.backendDOMNodeId);
+        } catch (error) {
+          if (!closedShadowRef) throw error;
+        }
       } else {
         const focus = await evaluate(id, FOCUS_JS(input.ref));
         if (!focus || focus.ok !== true) throw new Error(focus?.error ?? "element ref not found; take a new snapshot");
@@ -1368,9 +1729,37 @@ export function createChromeController(chromeApi, options = {}) {
     }
     await send(id, "Input.insertText", { text });
     await new Promise((resolve) => setTimeout(resolve, 120));
-    const focus = await evaluate(id, EDITABLE_JS);
+    let focus;
+    try {
+      focus = await evaluate(id, EDITABLE_JS);
+    } catch (error) {
+      // Reading the focused element can fail for closed-shadow inputs (the
+      // active element is the host and page-side helpers can throw); the text
+      // was already inserted, so report success without a verified value.
+      if (!closedShadowRef) throw error;
+      focus = undefined;
+    }
     if (focus?.editable !== true) {
-      throw new Error("the focused element is not editable; take a snapshot and pass a textbox ref, or click the input first");
+      if (!closedShadowRef) {
+        throw new Error("the focused element is not editable; take a snapshot and pass a textbox ref, or click the input first");
+      }
+      // Closed shadow input: activeElement retargets to the host, so page JS
+      // cannot read the internal value. Input.insertText already targeted the
+      // focused node inside the shadow root.
+      const settle = await settlePage(id);
+      const info = await pageInfo(id);
+      return {
+        ok: true,
+        tabId: id,
+        typed: text,
+        value: "",
+        verified: false,
+        note: "element is inside a closed shadow root; page JS cannot read the input value (text was inserted via Input.insertText)",
+        url: info.url,
+        title: info.title,
+        settle,
+        changed: Number(settle?.mutations ?? 0) > 0,
+      };
     }
     const settle = await settlePage(id);
     const info = await pageInfo(id);
@@ -1378,7 +1767,7 @@ export function createChromeController(chromeApi, options = {}) {
       ok: true,
       tabId: id,
       typed: text,
-      value: typeof focus.value === "string" ? focus.value : "",
+      value: typeof focus?.value === "string" ? focus.value : "",
       url: info.url,
       title: info.title,
       settle,
@@ -1459,8 +1848,13 @@ export function createChromeController(chromeApi, options = {}) {
     if (info === undefined) throw new Error("element ref " + ref + " is not in the current snapshot; take a new snapshot");
     const paths = Array.isArray(input.paths) ? input.paths.filter((value) => typeof value === "string" && value !== "") : [];
     if (paths.length === 0) throw new Error("upload requires at least one file path");
-    const nodeId = await axNodeId(id, info.backendDOMNodeId);
-    await send(id, "DOM.setFileInputFiles", { nodeId, files: paths });
+    let nodeId;
+    try {
+      nodeId = await axNodeId(id, info.backendDOMNodeId);
+    } catch {
+      nodeId = undefined;
+    }
+    await sendBounded(id, "DOM.setFileInputFiles", nodeId === undefined ? { backendNodeId: info.backendDOMNodeId, files: paths } : { nodeId, files: paths }, 5000);
     const settle = await settlePage(id);
     const info2 = await pageInfo(id);
     return { ok: true, tabId: id, ref, paths, url: info2.url, title: info2.title, settle, changed: Number(settle?.mutations ?? 0) > 0 };
@@ -1655,25 +2049,41 @@ export function createChromeController(chromeApi, options = {}) {
 
   /** Viewport coordinates of an AX ref: resolve the node, scroll it in, measure. */
   async function refScreenshotClip(tabId, ref, refInfo) {
+    // Closed-shadow refs cannot be measured through a JS object (page JS cannot
+    // reach them); go straight to the box model, which also avoids a call that
+    // can hang on Chrome's closed-shadow boundary.
+    const closedShadow = refInfo.shadow === "closed";
     let objectId;
-    try {
-      const resolved = await send(tabId, "DOM.resolveNode", { backendNodeId: refInfo.backendDOMNodeId });
-      if (typeof resolved?.objectId === "string") objectId = resolved.objectId;
-    } catch {
-      objectId = undefined;
+    if (!closedShadow) {
+      try {
+        const resolved = await sendBounded(tabId, "DOM.resolveNode", { backendNodeId: refInfo.backendDOMNodeId }, 1500);
+        if (typeof resolved?.objectId === "string") objectId = resolved.objectId;
+      } catch {
+        objectId = undefined;
+      }
     }
     if (objectId === undefined) {
-      const nodeId = await axNodeId(tabId, refInfo.backendDOMNodeId);
-      const resolved = await send(tabId, "DOM.resolveNode", { nodeId });
-      if (typeof resolved?.objectId !== "string") throw new Error(`element ref ${ref} could not be resolved; take a new snapshot`);
-      objectId = resolved.objectId;
+      const measured = await boxModelRect(tabId, refInfo.backendDOMNodeId);
+      if (measured === undefined) throw new Error(`element ref ${ref} could not be resolved; take a new snapshot`);
+      const offset = refInfo.offset ?? { x: 0, y: 0 };
+      return {
+        x: Math.max(0, measured.rect.x + Number(offset.x ?? 0)),
+        y: Math.max(0, measured.rect.y + Number(offset.y ?? 0)),
+        width: measured.rect.width,
+        height: measured.rect.height,
+      };
     }
-    const response = await send(tabId, "Runtime.callFunctionOn", {
-      objectId,
-      functionDeclaration: ELEMENT_RECT_FN,
-      returnByValue: true,
-      awaitPromise: true,
-    });
+    const response = await sendBounded(
+      tabId,
+      "Runtime.callFunctionOn",
+      {
+        objectId,
+        functionDeclaration: ELEMENT_RECT_FN,
+        returnByValue: true,
+        awaitPromise: true,
+      },
+      2500,
+    );
     if (response?.exceptionDetails) throw new Error(`element ref ${ref} could not be measured; take a new snapshot`);
     const clip = clipFromRect(response?.result?.value);
     // Child-frame refs are measured in their own document; snapshot recorded the
@@ -1704,7 +2114,9 @@ export function createChromeController(chromeApi, options = {}) {
   }
 
   async function pageViewport(tabId) {
-    const value = await evaluate(tabId, VIEWPORT_METRICS_JS);
+    const response = await sendBounded(tabId, "Runtime.evaluate", { expression: VIEWPORT_METRICS_JS, returnByValue: true, awaitPromise: true }, 3000);
+    if (response?.exceptionDetails) throw new Error(String(response.exceptionDetails.text ?? "page evaluation failed"));
+    const value = response?.result?.value;
     if (value === null || typeof value !== "object") throw new Error("the page did not report its viewport");
     return {
       viewport: {
@@ -1756,6 +2168,24 @@ export function createChromeController(chromeApi, options = {}) {
   }
 
   /**
+   * Page.captureScreenshot occasionally never settles on a background tab
+   * (Chrome 156): the first call waits for a frame the renderer does not
+   * deliver. A second call after the bound expires captures immediately, so
+   * retry once instead of surfacing a flaky failure.
+   */
+  async function capturePageScreenshot(tabId, params) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await sendBounded(tabId, "Page.captureScreenshot", params, attempt === 0 ? 4000 : 12000);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  /**
    * Full-page capture without `captureBeyondViewport`.
    *
    * Real Chrome 156 hangs on `Page.captureScreenshot` when captureBeyondViewport
@@ -1787,7 +2217,7 @@ export function createChromeController(chromeApi, options = {}) {
       await delay(120);
       const params = { format, fromSurface: true };
       if (quality !== undefined) params.quality = quality;
-      const response = await send(tabId, "Page.captureScreenshot", params);
+      const response = await capturePageScreenshot(tabId, params);
       if (typeof response?.data !== "string" || response.data === "") throw new Error("fullPage screenshot failed");
       const effectiveDsf = effectiveDeviceScaleFactor(tabId, measured.viewport.devicePixelRatio);
       return {
@@ -1866,7 +2296,7 @@ export function createChromeController(chromeApi, options = {}) {
       // clip.scale is mandatory in current CDP; keep the caller's scale (or 1).
       params.clip = { ...clip, scale: Number(clip.scale) > 0 ? Number(clip.scale) : 1 };
     }
-    const response = await send(id, "Page.captureScreenshot", params);
+    const response = await capturePageScreenshot(id, params);
     if (typeof response?.data !== "string" || response.data === "") throw new Error("screenshot failed");
     if (response.data.length > MAX_CAPTURE_BASE64) {
       throw new Error(`screenshot is too large for the bridge (${response.data.length} base64 chars; limit ${MAX_CAPTURE_BASE64}) — lower deviceScaleFactor or capture a smaller clip`);
@@ -2108,6 +2538,8 @@ export function createChromeController(chromeApi, options = {}) {
           return await navigate(command.tabId, command.url);
         case "snapshot":
           return await snapshot(command.tabId);
+        case "find":
+          return await find(command.tabId, command);
         case "click":
           return await click(command.tabId, command);
         case "type":
@@ -2145,6 +2577,7 @@ export function createChromeController(chromeApi, options = {}) {
     detachAll,
     navigate,
     snapshot,
+    find,
     click,
     type,
     key,

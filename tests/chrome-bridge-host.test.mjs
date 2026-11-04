@@ -14,7 +14,7 @@ process.env.DSH_CHROME_BRIDGE_SHOT_DIR = join(mkdtempSync(join(tmpdir(), "dsh-ch
 
 const plugin = await import("../index.js");
 
-const EXPECTED_ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "detachAll", "navigate", "snapshot", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
+const EXPECTED_ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "detachAll", "navigate", "snapshot", "find", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
 
 /** Minimal PNG header: the host only parses the IHDR pixel size. */
 function makePngHeader(width, height) {
@@ -195,6 +195,25 @@ function startFakeExtension(port, received, options = {}) {
         return { ok: true, tabId: cmd.tabId };
       case "detach-all":
         return { ok: true, detached: 1, tabIds: [1] };
+      case "find":
+        return {
+          ok: true,
+          tabId: cmd.tabId,
+          scanned: 10,
+          shadowRoots: { open: 0, closed: 1 },
+          matches: [
+            {
+              ref: "n7",
+              tag: "div",
+              role: "generic",
+              name: "提交",
+              rect: { x: 1, y: 2, width: 3, height: 4 },
+              center: { x: 2, y: 4 },
+              shadow: "closed",
+              match: "text",
+            },
+          ],
+        };
       case "navigate":
         return { ok: true, tabId: cmd.tabId, url: cmd.url, title: "Example Domain" };
       case "snapshot":
@@ -600,6 +619,61 @@ test("detachAll reaches the extension and formats its count", async () => {
     extension?.socket.close();
     harness.disposeAll();
   }
+});
+
+test("find reaches the extension and formats rects with shadow markers", async () => {
+  const harness = makeContext();
+  plugin.apply(harness.ctx);
+  const received = [];
+  let extension;
+  try {
+    const port = await waitForPort(harness.tools[0]);
+    extension = startFakeExtension(port, received);
+    await extension.ready;
+    const result = await harness.tools[0].execute({ action: "find", tabId: 1, text: "提交" });
+    assert.match(result.text, /found 1 match\(es\) in tab 1 \(scanned 10 DOM nodes; shadow roots open=0 closed=1\)/);
+    assert.match(result.text, /\[n7\] <div> generic "提交" rect=1,2 3x4 center=2,4 \[shadow: closed\] \(text\)/);
+    assert.deepEqual(received.map((command) => command.type), ["find"]);
+    assert.equal(received[0].text, "提交");
+    assert.equal(received[0].limit, 20);
+  } finally {
+    extension?.socket.close();
+    harness.disposeAll();
+  }
+});
+
+test("toCommand validates and builds find commands", () => {
+  const { toCommand, formatResult, formatSnapshot } = plugin.__test;
+  assert.deepEqual(toCommand("find", { tabId: 1, text: " 提交 " }), { type: "find", tabId: 1, text: "提交", limit: 20 });
+  assert.deepEqual(toCommand("find", { tabId: 1, tag: "XHS-PUBLISH-BTN" }), { type: "find", tabId: 1, tag: "xhs-publish-btn", limit: 20 });
+  assert.deepEqual(toCommand("find", { tabId: 1, selector: "#submit", limit: 999 }), { type: "find", tabId: 1, selector: "#submit", limit: 50 });
+  assert.throws(() => toCommand("find", { tabId: 1 }), /find requires text, tag or selector/);
+  assert.throws(() => toCommand("find", { tabId: 1, text: "x", limit: 0 }), /limit must be a positive number/);
+  assert.throws(() => toCommand("find", { text: "x" }), /tabId is required/);
+  const text = formatResult("find", {
+    ok: true,
+    tabId: 1,
+    scanned: 42,
+    shadowRoots: { open: 0, closed: 2 },
+    matches: [
+      { ref: "n901", tag: "div", role: "generic", name: "提交", rect: { x: 10, y: 20, width: 110, height: 40 }, center: { x: 65, y: 40 }, shadow: "none", match: "text" },
+      { ref: "n802", tag: "div", name: "立即发布", shadow: "closed", match: "text" },
+    ],
+  });
+  assert.match(text, /found 2 match\(es\)/);
+  assert.match(text, /\[n901\] <div> generic "提交" rect=10,20 110x40 center=65,40 \(text\)/);
+  assert.match(text, /\[n802\] <div> "立即发布" rect=unavailable \[shadow: closed\] \(text\)/);
+  assert.match(text, /refs are clickable/i);
+  const snapshotText = formatSnapshot({
+    tabId: 1,
+    title: "t",
+    url: "u",
+    backend: "ax",
+    shadowElements: 1,
+    elements: [{ ref: "n200", role: "generic", text: "提交", depth: 0, shadow: "closed" }],
+  });
+  assert.match(snapshotText, /1 in closed shadow root/);
+  assert.match(snapshotText, /\[n200\] generic "提交" \[shadow: closed\]/);
 });
 
 test("unknown actions are rejected", async () => {

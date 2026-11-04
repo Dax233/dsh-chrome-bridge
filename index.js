@@ -23,7 +23,7 @@ const SHOT_DIR = process.env.DSH_CHROME_BRIDGE_SHOT_DIR ?? join(tmpdir(), "dsh-c
 /** Detach debugger sessions when the last running turn ends (default on; 0 disables). */
 const AUTO_DETACH = process.env.DSH_CHROME_BRIDGE_AUTO_DETACH !== "0";
 
-const ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "detachAll", "navigate", "snapshot", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
+const ACTIONS = ["status", "tabs", "newTab", "closeTab", "attach", "detach", "detachAll", "navigate", "snapshot", "find", "click", "type", "key", "scroll", "screenshot", "emulate", "logs", "upload", "evaluate", "wait"];
 
 /** Formats Page.captureScreenshot accepts; the file extension differs for jpeg. */
 const SCREENSHOT_FORMATS = new Set(["png", "jpeg", "webp"]);
@@ -161,10 +161,11 @@ const DESCRIPTION =
     "Use action=tabs to list tabs; prefer action=newTab {url} to open a fresh tab in the background, then " +
   "action=attach with its tabId before other tab actions. " +
   "action=status also reports whether Chrome has a usable window and the DSH Agent tab-group state. " +
-  "Actions: newTab {url, active?}, closeTab {tabId}, navigate {tabId,url}, snapshot {tabId}, click {tabId,ref|x,y}, " +
+  "Actions: newTab {url, active?}, closeTab {tabId}, navigate {tabId,url}, snapshot {tabId}, find {tabId,text?,tag?,selector?,limit?}, click {tabId,ref|x,y}, " +
   "type {tabId,text,ref?}, key {tabId,key}, scroll {tabId,deltaY}, screenshot {tabId,format?,quality?,fullPage?,clip?,ref?,selector?}, " +
   "emulate {tabId,width?,height?,deviceScaleFactor?,mobile?,colorScheme?,reset?}, logs {tabId,limit?,filter?,clear?}, upload {tabId,ref,paths}, " +
   "evaluate {tabId,expression}, wait {tabId,selector?,text?,networkIdle?,idleMs?,ms?}, detach {tabId}, detachAll {}. " +
+  "action=find searches the page structure (text/tag/light-DOM selector) and returns refs + rects, including elements inside closed shadow roots that the accessibility snapshot filters out; snapshot also marks rescued closed-shadow entries with [shadow: closed]. " +
   "Debugger sessions are detached automatically when the running turn ends, so Chrome's debugging infobar does not linger; action=detachAll clears them immediately (and after a Host disconnect the extension detaches too). " +
   "screenshot fullPage temporarily grows the emulated viewport and captures it (capped, real pixel size reported); clip is a viewport (CSS px) rectangle; ref/selector are scrolled into view first; format png|jpeg|webp (quality only for jpeg/webp). " +
   "emulate drives real CDP Emulation: device metrics and prefers-color-scheme in this tab. " +
@@ -295,6 +296,23 @@ function toEmulateCommand(args) {
   return command;
 }
 
+/** Validate and build the page-structure search command. */
+function toFindCommand(args) {
+  const text = typeof args.text === "string" ? args.text.trim() : "";
+  const tag = typeof args.tag === "string" ? args.tag.trim().toLowerCase() : "";
+  const selector = typeof args.selector === "string" ? args.selector.trim() : "";
+  if (text === "" && tag === "" && selector === "") throw new Error("chrome: find requires text, tag or selector");
+  const limit = Number(args.limit ?? 20);
+  if (!Number.isFinite(limit) || limit <= 0) throw new Error("chrome: find limit must be a positive number");
+  return {
+    type: "find",
+    ...(text === "" ? {} : { text }),
+    ...(tag === "" ? {} : { tag }),
+    ...(selector === "" ? {} : { selector }),
+    limit: Math.min(50, Math.floor(limit)),
+  };
+}
+
 function toCommand(action, args) {
   switch (action) {
     case "tabs":
@@ -313,6 +331,8 @@ function toCommand(action, args) {
       return { type: "navigate", tabId: requireTabId(args), url: requireHttpUrl(args.url) };
     case "snapshot":
       return { type: "snapshot", tabId: requireTabId(args) };
+    case "find":
+      return { ...toFindCommand(args), tabId: requireTabId(args) };
     case "screenshot":
       return toScreenshotCommand(args);
     case "emulate":
@@ -400,6 +420,7 @@ function formatSnapshot(snapshot) {
   const details = [];
   if (skipped > 0) details.push(`${skipped} hidden skipped`);
   if (omitted > 0) details.push(`${omitted} over limit`);
+  if (Number(snapshot?.shadowElements ?? 0) > 0) details.push(`${Number(snapshot.shadowElements)} in closed shadow root`);
   lines.push(`elements (${elements.length}${details.length > 0 ? `, ${details.join(", ")}` : ""}):`);
   const isAx = snapshot?.backend === "ax" || elements.some((element) => element.role !== undefined);
   if (isAx) {
@@ -417,7 +438,8 @@ function formatSnapshot(snapshot) {
       const value = element.value === undefined ? "" : ` = ${JSON.stringify(String(element.value))}`;
       const checked = element.checked === true ? " [checked]" : "";
       const frame = element.frame !== undefined ? " (iframe)" : "";
-      lines.push(`${"  ".repeat(1 + depth)}${ref}${role} "${text}"${value}${checked}${frame}`);
+      const shadow = element.shadow ? ` [shadow: ${String(element.shadow)}]` : "";
+      lines.push(`${"  ".repeat(1 + depth)}${ref}${role} "${text}"${value}${checked}${frame}${shadow}`);
     }
     if (elements.length > MAX_LINES) {
       lines.push(`  ... ${elements.length - MAX_LINES} more in this snapshot; scroll or narrow the page`);
@@ -524,6 +546,28 @@ function saveScreenshot(base64, format = "png") {
   return { file, bytes: bytes.length, format: normalized, ...(size === undefined ? {} : { image: size }) };
 }
 
+/** Render a page-structure search result (text/tag/selector -> refs + rects). */
+function formatFind(value) {
+  const matches = Array.isArray(value?.matches) ? value.matches : [];
+  const shadowRoots = value?.shadowRoots ?? {};
+  const lines = [
+    `found ${matches.length} match(es) in tab ${String(value?.tabId ?? "")} (scanned ${Number(value?.scanned ?? 0)} DOM nodes; shadow roots open=${Number(shadowRoots.open ?? 0)} closed=${Number(shadowRoots.closed ?? 0)})`,
+  ];
+  for (const match of matches.slice(0, 50)) {
+    const rect = match?.rect
+      ? `rect=${Number(match.rect.x)},${Number(match.rect.y)} ${Number(match.rect.width)}x${Number(match.rect.height)} center=${Number(match?.center?.x ?? 0)},${Number(match?.center?.y ?? 0)}`
+      : "rect=unavailable";
+    const shadow = match?.shadow !== undefined && match.shadow !== "none" ? ` [shadow: ${String(match.shadow)}]` : "";
+    const role = match?.role ? ` ${String(match.role)}` : "";
+    const name = match?.name ? ` "${String(match.name).replace(/\s+/g, " ").slice(0, 80)}"` : "";
+    lines.push(`  [${String(match?.ref ?? "")}] <${String(match?.tag ?? "")}>${role}${name} ${rect}${shadow} (${String(match?.match ?? "")})`);
+  }
+  if (matches.length > 50) lines.push(`  ... ${matches.length - 50} more matches omitted (narrow text/tag or raise limit)`);
+  if (typeof value?.hint === "string" && value.hint !== "") lines.push(`  hint: ${value.hint}`);
+  if (matches.length > 0) lines.push("Matches include closed shadow DOM; refs are clickable (action=click {ref}) until the page changes.");
+  return lines.join("\n");
+}
+
 function formatResult(action, value) {
   switch (action) {
     case "tabs": {
@@ -549,6 +593,8 @@ function formatResult(action, value) {
       return `navigated tab ${value.tabId} to ${String(value.url ?? "")}${value.title ? ` (${value.title})` : ""}`;
     case "snapshot":
       return formatSnapshot(value.snapshot);
+    case "find":
+      return formatFind(value);
     case "click":
       if (value.method === "iframe-script" || value.method === "ax-script") {
         return `clicked tab ${value.tabId} ${value.label ? `"${String(value.label).slice(0, 60)}" ` : ""}(iframe script click)${
@@ -857,14 +903,16 @@ export function apply(ctx) {
             ref: { type: "string", description: "Element ref from the latest snapshot of that tab, e.g. n123 (host-side backendNodeId); used by click/type/upload and screenshot." },
             x: { type: "number", description: "Viewport x for a coordinate click." },
             y: { type: "number", description: "Viewport y for a coordinate click." },
-            text: { type: "string", description: "Text to type into the focused element." },
+            text: { type: "string", description: "Text to type into the focused element; action=find: text to search for (substring of visible text/aria-label/title/placeholder)." },
+            tag: { type: "string", description: "action=find: DOM tag name to match, including custom elements (e.g. xhs-publish-btn, button, div)." },
+            limit: { type: "integer", description: "action=find: maximum matches to return (default 20, max 50)." },
             paths: { type: "array", items: { type: "string" }, description: "Absolute file paths for upload (with ref pointing at a file input)." },
             expression: { type: "string", description: "JavaScript expression for action=evaluate (debugging/inspection)." },
             filter: { type: "string", description: "Keyword filter for action=logs (matches text/url, case-insensitive)." },
             clear: { type: "boolean", description: "Clear the per-tab log buffer for action=logs." },
             selector: {
               type: "string",
-              description: "CSS selector: the element to wait for (action=wait) or to capture (action=screenshot).",
+              description: "CSS selector: the element to wait for (action=wait), to capture (action=screenshot), or to search (action=find; light DOM only — closed shadow content is matched by text/tag).",
             },
             ms: { type: "number", description: "Overall timeout for action=wait in milliseconds (also a pure delay when no condition is given)." },
             networkIdle: {

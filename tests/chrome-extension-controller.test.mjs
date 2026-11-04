@@ -192,9 +192,24 @@ function makeChromeMock() {
           }
           return { nodeIds: [state.frontendNodeId ?? 7] };
         }
+        if (method === "DOM.getDocument") {
+          if (Number(params?.depth) < 0) return { root: state.domTree ?? { nodeId: 1, backendNodeId: 1, nodeType: 9, nodeName: "#document", children: [] } };
+          return { root: { nodeId: 1, backendNodeId: 1, nodeType: 9, nodeName: "#document", children: [] } };
+        }
+        if (method === "DOM.querySelectorAll") {
+          return { nodeIds: state.querySelectorNodeIds ?? [] };
+        }
         if (method === "Page.getFrameTree") return state.frameTree === undefined ? {} : { frameTree: state.frameTree };
         if (method === "DOM.getFrameOwner") return { backendNodeId: state.frameOwners?.[params?.frameId] };
-        if (method === "DOM.describeNode") return { node: { frameId: state.describeFrameIds?.[params?.nodeId] } };
+        if (method === "DOM.describeNode") {
+          const backendNodeId = state.describeBackendNodeIds?.[params?.nodeId];
+          return {
+            node: {
+              ...(backendNodeId === undefined ? {} : { backendNodeId }),
+              ...(state.describeFrameIds?.[params?.nodeId] === undefined ? {} : { frameId: state.describeFrameIds[params.nodeId] }),
+            },
+          };
+        }
         if (method === "Runtime.callFunctionOn") {
           const declaration = String(params?.functionDeclaration ?? "");
           if (declaration.includes("__dshAgentElementRect")) return { result: { value: state.elementRect ?? { x: 100, y: 250, width: 80, height: 40 } } };
@@ -204,12 +219,25 @@ function makeChromeMock() {
           return state.layoutMetrics ?? { cssContentSize: { width: 1200, height: 3000 }, contentSize: { width: 1200, height: 2800 } };
         }
         if (method === "DOM.getBoxModel") {
-          return { model: { content: state.boxModels?.[params?.nodeId] ?? [0, 0, 10, 0, 10, 10, 0, 10] } };
+          const key = params?.backendNodeId ?? params?.nodeId;
+          return { model: { content: state.boxModels?.[key] ?? state.boxModels?.[params?.nodeId] ?? [0, 0, 10, 0, 10, 10, 0, 10] } };
         }
         if (method === "DOM.getNodeForLocation" && state.hitBackendNodeId !== undefined) return { backendNodeId: state.hitBackendNodeId };
-        if (method === "DOM.resolveNode") return { objectId: "object-1" };
+        if (method === "DOM.resolveNode") {
+          const backendId = params?.backendNodeId;
+          if (state.closedShadowBackendIds !== undefined && backendId !== undefined && state.closedShadowBackendIds.has(backendId)) {
+            throw new Error("Could not find node with given id");
+          }
+          return { objectId: "object-1" };
+        }
         if (method === "Page.createIsolatedWorld") return { executionContextId: 5 };
-        if (method === "Page.captureScreenshot") return { data: "AAAA" };
+        if (method === "Page.captureScreenshot") {
+          if (state.captureFailOnce === true) {
+            state.captureFailOnce = false;
+            throw new Error("capture did not answer");
+          }
+          return { data: "AAAA" };
+        }
         return {};
       },
     },
@@ -676,6 +704,200 @@ test("AX snapshot uses backendNodeId refs resolved on the host side", async () =
   assert.ok(click.x > 0 && click.y > 0);
 });
 
+test("closed-shadow elements are rescued into the accessibility snapshot", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  state.axTree = [
+    { nodeId: "1", ignored: false, role: { value: "RootWebArea" }, name: { value: "page" }, backendDOMNodeId: 100 },
+    { nodeId: "2", parentId: "1", ignored: false, role: { value: "button" }, name: { value: "发布" }, backendDOMNodeId: 123 },
+    { nodeId: "3", parentId: "1", ignored: false, role: { value: "generic" }, name: { value: "提交" }, backendDOMNodeId: 200 },
+    { nodeId: "4", parentId: "3", ignored: false, role: { value: "StaticText" }, name: { value: "提交" }, backendDOMNodeId: 201 },
+  ];
+  const textNode = (id, value) => ({ backendNodeId: id, nodeId: id, nodeType: 3, nodeName: "#text", nodeValue: value, children: [], shadowRoots: [] });
+  const element = (backendId, nodeName, extra = {}) => ({ backendNodeId: backendId, nodeId: backendId, nodeType: 1, nodeName, attributes: [], children: [], shadowRoots: [], ...extra });
+  state.domTree = element(1, "#document", {
+    nodeType: 9,
+    children: [
+      element(100, "BODY", {
+        children: [
+          element(500, "XHS-PUBLISH-BTN", {
+            shadowRoots: [
+              {
+                backendNodeId: 501,
+                nodeId: 501,
+                nodeType: 11,
+                nodeName: "#shadow-root",
+                shadowRootType: "closed",
+                children: [
+                  element(123, "BUTTON", { attributes: ["aria-label", "发布"], children: [textNode(1231, "发布")] }),
+                  element(200, "DIV", { children: [textNode(2001, "提交")] }),
+                ],
+              },
+            ],
+          }),
+        ],
+      }),
+    ],
+  });
+  const controller = createChromeController(chromeApi);
+  const result = await controller.snapshot(1);
+  assert.equal(result.ok, true);
+  const rescued = result.snapshot.elements.find((element) => element.ref === "n200");
+  assert.ok(rescued, "a closed-shadow div with text must be listed even when the AX tree ignores it");
+  assert.equal(rescued.shadow, "closed");
+  const button = result.snapshot.elements.find((element) => element.ref === "n123");
+  assert.equal(button.shadow, "closed", "regular AX elements inside a closed shadow root are marked too");
+  assert.equal(result.snapshot.shadowElements, 2);
+  assert.equal(result.snapshot.elements.some((element) => element.ref === "n201"), false, "text nodes are not rescued");
+  const click = await controller.click(1, { ref: "n200" });
+  assert.equal(click.ok, true, "a rescued closed-shadow ref must stay clickable by coordinates");
+});
+
+test("screenshot of a closed-shadow ref falls back to the box model", async () => {
+  const { chromeApi, state, calls } = makeChromeMock();
+  state.axTree = [
+    { nodeId: "1", ignored: false, role: { value: "RootWebArea" }, name: { value: "page" }, backendDOMNodeId: 100 },
+    { nodeId: "2", parentId: "1", ignored: false, role: { value: "button" }, name: { value: "发布" }, backendDOMNodeId: 200 },
+  ];
+  state.closedShadowBackendIds = new Set([200]);
+  state.boxModels = { 200: [10, 20, 110, 20, 110, 70, 10, 70] };
+  state.domTree = {
+    backendNodeId: 1,
+    nodeId: 1,
+    nodeType: 9,
+    nodeName: "#document",
+    children: [
+      {
+        backendNodeId: 500,
+        nodeId: 500,
+        nodeType: 1,
+        nodeName: "XHS-PUBLISH-BTN",
+        attributes: [],
+        children: [],
+        shadowRoots: [
+          {
+            backendNodeId: 501,
+            nodeId: 501,
+            nodeType: 11,
+            nodeName: "#shadow-root",
+            shadowRootType: "closed",
+            children: [{ backendNodeId: 200, nodeId: 200, nodeType: 1, nodeName: "BUTTON", attributes: ["aria-label", "发布"], children: [], shadowRoots: [] }],
+          },
+        ],
+      },
+    ],
+    shadowRoots: [],
+  };
+  const controller = createChromeController(chromeApi);
+  await controller.snapshot(1);
+  const shot = await controller.captureScreenshot(1, { ref: "n200" });
+  assert.equal(shot.ok, true);
+  assert.equal(shot.data, "AAAA");
+  const boxCall = calls.find((call) => call.cdp === "DOM.getBoxModel" && call.params?.backendNodeId === 200);
+  assert.ok(boxCall, "closed-shadow refs must measure through backendNodeId box model");
+});
+
+test("type into a closed-shadow ref reports an unverified success instead of failing", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  state.axTree = [
+    { nodeId: "1", ignored: false, role: { value: "RootWebArea" }, name: { value: "page" }, backendDOMNodeId: 100 },
+    { nodeId: "2", parentId: "1", ignored: false, role: { value: "textbox" }, name: { value: "输入内容" }, backendDOMNodeId: 400 },
+  ];
+  state.closedShadowBackendIds = new Set([400]);
+  state.boxModels = { 400: [20, 30, 220, 30, 220, 60, 20, 60] };
+  state.editable = { editable: false, tag: "shadow-input", value: "" };
+  const controller = createChromeController(chromeApi);
+  await controller.snapshot(1);
+  const typed = await controller.type(1, { ref: "n400", text: "hello" });
+  assert.equal(typed.ok, true);
+  assert.equal(typed.verified, false);
+  assert.match(String(typed.note), /closed shadow root/);
+});
+
+test("find locates light-DOM and closed-shadow elements with rects and shadow flags", async () => {
+  const { chromeApi, state } = makeChromeMock();
+  const textNode = (id, value) => ({ backendNodeId: id, nodeId: id, nodeType: 3, nodeName: "#text", nodeValue: value, children: [], shadowRoots: [] });
+  const element = (backendId, nodeName, extra = {}) => ({ backendNodeId: backendId, nodeId: backendId, nodeType: 1, nodeName, attributes: [], children: [], shadowRoots: [], ...extra });
+  state.domTree = element(1, "#document", {
+    nodeType: 9,
+    children: [
+      element(900, "BODY", {
+        children: [
+          element(901, "DIV", { attributes: ["data-testid", "btn-3"], children: [textNode(9011, "提交")] }),
+          element(700, "XHS-PUBLISH-BTN", {
+            shadowRoots: [
+              {
+                backendNodeId: 701,
+                nodeId: 701,
+                nodeType: 11,
+                nodeName: "#shadow-root",
+                shadowRootType: "closed",
+                children: [element(702, "BUTTON", { attributes: ["aria-label", "发布"], children: [textNode(7021, "发布")] })],
+              },
+            ],
+          }),
+          element(800, "BARE-HOST-BTN", {
+            shadowRoots: [
+              {
+                backendNodeId: 801,
+                nodeId: 801,
+                nodeType: 11,
+                nodeName: "#shadow-root",
+                shadowRootType: "closed",
+                children: [element(802, "DIV", { children: [textNode(8021, "立即发布")] })],
+              },
+            ],
+          }),
+        ],
+      }),
+    ],
+  });
+  state.axTree = [
+    { nodeId: "1", ignored: false, role: { value: "RootWebArea" }, name: { value: "page" }, backendDOMNodeId: 100 },
+    { nodeId: "2", ignored: false, role: { value: "button" }, name: { value: "发布" }, backendDOMNodeId: 702 },
+    { nodeId: "3", ignored: false, role: { value: "generic" }, name: { value: "提交" }, backendDOMNodeId: 901 },
+    { nodeId: "4", ignored: false, role: { value: "generic" }, name: { value: "立即发布" }, backendDOMNodeId: 802 },
+  ];
+  state.boxModels = {
+    901: [10, 20, 120, 20, 120, 60, 10, 60],
+    802: [10, 100, 120, 100, 120, 140, 10, 140],
+    700: [5, 5, 200, 5, 200, 50, 5, 50],
+  };
+  state.querySelectorNodeIds = [5];
+  state.describeBackendNodeIds = { 5: 901 };
+  const controller = createChromeController(chromeApi);
+  await controller.attach(1);
+
+  const byText = await controller.execute({ type: "find", tabId: 1, text: "提交" });
+  assert.equal(byText.ok, true);
+  assert.ok(byText.matches.length >= 1);
+  assert.equal(byText.matches[0].ref, "n901");
+  assert.equal(byText.matches[0].shadow, "none");
+  assert.deepEqual(byText.matches[0].center, { x: 65, y: 40 });
+
+  const inShadow = await controller.execute({ type: "find", tabId: 1, text: "立即发布" });
+  assert.equal(inShadow.ok, true);
+  const shadowMatch = inShadow.matches.find((match) => match.ref === "n802");
+  assert.ok(shadowMatch, "text inside a closed shadow root must be found");
+  assert.equal(shadowMatch.shadow, "closed");
+  assert.deepEqual(shadowMatch.rect, { x: 10, y: 100, width: 110, height: 40 });
+
+  const byTag = await controller.execute({ type: "find", tabId: 1, tag: "xhs-publish-btn" });
+  assert.equal(byTag.ok, true);
+  assert.ok(byTag.matches.some((match) => match.ref === "n700" && match.match === "tag"));
+
+  const bySelector = await controller.execute({ type: "find", tabId: 1, selector: "#submit" });
+  assert.equal(bySelector.ok, true);
+  assert.ok(bySelector.matches.some((match) => match.ref === "n901" && match.match === "selector"));
+
+  const none = await controller.execute({ type: "find", tabId: 1, text: "绝对不存在的文字" });
+  assert.equal(none.ok, true);
+  assert.deepEqual(none.matches, []);
+  assert.match(String(none.hint), /no match/);
+
+  const click = await controller.click(1, { ref: "n901" });
+  assert.equal(click.ok, true, "find results register refs that click can use");
+});
+
 test("logs collects console/network events for the attached tab", async () => {
   const { chromeApi, state } = makeChromeMock();
   const controller = createChromeController(chromeApi);
@@ -834,6 +1056,17 @@ test("logs supports keyword filtering and clearing", async () => {
   assert.equal(cleared.total, 0);
   const after = await controller.logs(1);
   assert.equal(after.entries.length, 0);
+});
+
+test("screenshot retries once when the first capture never answers", async () => {
+  const { chromeApi, calls, state } = makeChromeMock();
+  state.captureFailOnce = true;
+  const controller = createChromeController(chromeApi);
+  const result = await controller.captureScreenshot(1);
+  assert.equal(result.ok, true);
+  assert.equal(result.data, "AAAA");
+  const attempts = calls.filter((call) => call.cdp === "Page.captureScreenshot");
+  assert.equal(attempts.length, 2, "one failed attempt + one retry");
 });
 
 test("screenshot fullPage grows the emulated viewport, captures it, then restores", async () => {

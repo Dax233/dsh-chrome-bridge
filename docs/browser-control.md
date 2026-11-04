@@ -831,3 +831,60 @@ chrome 桥会重复建组」。以下均为真机复现（Chrome 156，真实用
 **0.1.34（同日补丁）**：`ws.js` 的 `sanitizeState` 之前会丢弃扩展新增的 `attachedTabs` 字段，导致 `status.state.attachedTabs`
 实际不可见；0.1.34 把它加入白名单（仅保留 >0 的数字 tabId），并有单测覆盖。Host 半需下次重启 DSH 生效；
 不影响 0.1.33 的自动 detach 行为。
+
+### 34.13 closed shadow DOM 可定位：`find` 结构检索 + snapshot 影子树救援（2026-11-04，0.1.35 → 0.1.36）
+
+需求（用户）：小红书发布按钮 `<xhs-publish-btn>` 内部是 **closed shadow root**。`snapshot` 的 a11y 树/DOM 元素表
+里完全没有它 → click by ref 无从谈起，模型误判「按钮不存在」；而按钮其实存在于页面结构中（只是页面 JS
+无法访问 closed shadow）。用户希望：给出文字/标签，能返回 rect + 是否在影子树里。
+
+**复现（真机 Chrome 156 + 本地 closed-shadow 测试页）**
+
+- 根因：Chrome 的 AX 树**能**看到 closed shadow 内容，但可点击的 `<div>` 在 AX 里是 `ignored:true` 或
+  role 不在交互/信息白名单里，被 snapshot 过滤；页面 JS `host.shadowRoot === null`，`querySelectorAll` 也
+  看不到。`DOM.resolveNode` 对 closed shadow 节点通常失败，但 **`DOM.getBoxModel` / `scrollIntoViewIfNeeded`
+  / `setFileInputFiles` 都接受 `backendNodeId`**，配合 CDP 点击坐标可用 → 定位与点击完全可以做到。
+- 另发现 Chrome 156 后台标签的 `Page.captureScreenshot` 偶发**永不返回**（首个截图调用等不到帧），
+  以及个别 CDP 调用可能挂起不 settle；这些会卡死扩展的命令队列，必须加超时/重试。
+
+**实现**
+
+- 新增工具动作 `find {tabId, text?, tag?, selector?, limit?}`（`{type:"find"}`）：`DOM.getDocument{depth:-1,pierce:true}`
+  遍历（含 author shadow root，区分 open/closed），支持 text（ownText/aria-label/title/placeholder/AX name，
+  找不到时回退聚合文本）、tag（含自定义元素名）、selector（light DOM，`DOM.querySelectorAll`）；每个命中返回
+  `ref`（`n<backendNodeId>`，已注册到 refs，可直接 click）、tag/role/name、`rect`+`center`、
+  `shadow: closed|open|none`、match 原因；上限 50。`scanned`/`shadowRoots` 给出扫描规模。
+- snapshot 影子树救援：每次 snapshot 额外做一次 `DOM.getDocument{depth:-1,pierce:true}`（20k 节点上限），
+  把 closed shadow 里带文本/aria-label/title/placeholder 的元素作为 `role: "generic"` 加入快照并标
+  `[shadow: closed]`（最多 20 个）；AX 已收录的 shadow 元素也会打上同样标记；`shadowElements` 计数。
+  这直接解决「snapshot 完全看不到、模型误判不存在」。
+- 动作兜底：`screenshot {ref}` 对 closed-shadow ref 直接走 `DOM.getBoxModel(backendNodeId)`（不再
+  resolveNode）；`upload` 命中 push 失败时用 `setFileInputFiles {backendNodeId}`；`type {ref}` 对
+  closed-shadow 输入用坐标点击聚焦 + `Input.insertText`，页面读不到内部值就返回 `ok:true, verified:false`
+  + note（instead of 报「not editable」）。
+- 稳定性：新增 `sendBounded`（CDP 调用 1.5–3s 上限）包住 boxModel/resolveNode/scrollIntoView/callFunctionOn/
+  pushNodes/setFileInputFiles 等易挂调用；`Page.captureScreenshot` 改为「第一次 4s 上限，超时重试一次 12s」
+  （Chrome 156 后台标签首帧截图的已知挂起，第二次通常立即成功）。任何 CDP 挂起不再无限阻塞命令队列。
+- 版本 0.1.36（package/manifest/Hello）；Host 半需重启 DSH 生效（新 tool action `find`），扩展 reload 即生效。
+
+**真机验证（0.1.36 扩展 + 本地 closed-shadow 页面）**
+
+- 测试页含：closed shadow 内 button（有 aria-label）、icon-only button、可点击 div（无 aria）、另一个
+  bare div、closed shadow input。`snapshot` 输出 5 个 `[shadow: closed]` 元素（button 发布/✏️、textbox
+  输入内容、generic 提交/立即发布）——之前一个都看不到。
+- `find {text:"立即发布"}` → `n38 <div> generic rect=50,443 56x22 [shadow: closed]`；`click n38` 触发页面
+  事件（`document.title = "CLICKED:btn-4"` 验证）；`find {tag:"xhs-publish-btn"}` 命中自定义元素宿主；
+  `find {text:"输入内容"}` 命中 shadow input；`type` 成功写入（页面 `#typed` 收到 `TYPED:hello`，
+  verified:false 符合 closed shadow 语义）。
+- `screenshot {ref}`（closed shadow）首次 4s 超时自动重试后成功（~4.2s），viewport 截图同样重试成功；
+  期间无命令队列卡死。
+- 单测 136 项全绿（新增：snapshot 影子救援、find（text/tag/selector/缺失 hint/click 复用 ref）、
+  screenshot box-model fallback、type closed-shadow 未验证成功、capture 重试）。真机浏览器测试通过
+  临时 harness 端口（扩展 options 改 47899 → `createExtensionBridge` 直连）验证，完成后已恢复 47835。
+
+**边界**
+
+- closed shadow 内容无法用页面 JS 访问，所以 `evaluate`/`wait {selector|text}` 仍看不到它；定位请走
+  `find`/snapshot 的 ref。`find`/snapshot 的影子树标记依赖 `DOM.getDocument{pierce:true}`，对超大页面
+  有扫描成本（snapshot 每次一次、find 每次一次；均有节点上限）。
+- 后台标签首帧截图仍可能有 4s 重试延迟（Chrome 156 行为），不是插件逻辑错误。

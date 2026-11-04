@@ -72,7 +72,7 @@ async function connect() {
     console.info(`[dsh-chrome-bridge] connected to Host (ws://127.0.0.1:${port}/ext)`);
     try {
       // The token is a handshake field, not a URL query: URLs leak into logs.
-      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.35", token }));
+      ws.send(JSON.stringify({ type: "hello", name: "dsh-chrome-bridge", version: "0.1.36", token }));
     } catch {
       // The close handler will reconnect.
     }

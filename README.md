@@ -30,18 +30,20 @@ GitHub Releases（由 `.github/workflows/release.yml` 在推送 `v*` tag 或手�
 
 ## 工具面
 
-`chrome(action)`：`status`、`tabs`、`newTab`、`closeTab`、`attach`、`detach`、`detachAll`、`navigate`、`snapshot`、`click`、`type`、`key`、`scroll`、`screenshot`、`emulate`、`logs`、`upload`、`evaluate`、`wait`。
+`chrome(action)`：`status`、`tabs`、`newTab`、`closeTab`、`attach`、`detach`、`detachAll`、`navigate`、`snapshot`、`find`、`click`、`type`、`key`、`scroll`、`screenshot`、`emulate`、`logs`、`upload`、`evaluate`、`wait`。
 
 安全/行为要点：
 
 - 只有 **DSH Agent 标签组** 内的 tab 可被驱动；`newTab` 自动入组，`attach` 是显式 opt-in（用户把 tab 拖出组即撤销）。
+- **closed shadow DOM 可定位**：`snapshot` 会把 closed shadow root 里带文本/aria-label 的元素救回列表并标 `[shadow: closed]`；`find {text|tag|selector}` 直接做页面结构检索（含影子树、自定义元素、rect/center），返回的 `ref` 可直接 `click`；`screenshot/upload/type` 对影子树 ref 有 `backendNodeId`/坐标兜底（closed shadow 里页面 JS 读不到值，`type` 返回 `verified:false` 而非误报失败）。
 - **调试提示条不跨轮残留**：桥的 WebSocket 跨 turn/session 常连（这是有意的控制通道），但 `chrome.debugger` 会话会在**最后一个运行中的 turn 结束**时自动全部 detach（父子 subagent 并发时等最后一个），所以 Chrome 的「…正在调试此浏览器」提示条随会话收尾消失；`chrome detachAll` 可立即手动清理，扩展在 Host 连接断开时也会自行 detach。`DSH_CHROME_BRIDGE_AUTO_DETACH=0` 可关闭自动 detach。
 - **连接 ≠ 可用**：Chrome 关掉最后一个窗口后台进程仍在时，WebSocket/心跳还活着。`status` 的 `usableWindows`、`windowState`（`disconnected`/`unknown`/`windowless`/`no-agent-group`/`ready`）、`lastError` 与扩展 state（`normalWindows/windows/tabs/agentGroups/attachedTabs/savedGroupPossible`）会指出“已连接但没有窗口/没有 Agent 组”，`tabs` 也会返回 windowless 文案并在“有窗口但列不出标签”时自动重试+诊断。
 - **无窗口自愈**：`newTab` 不再依赖 `current window`——每次实时解析 normal 窗口，零窗口时直接 `windows.create` 一个**聚焦**窗口（Chrome 156 对 `focused:false` 窗口的标签会拒绝分组），再建标签入组；`tabs.group` 命中 `Tabs can only be moved to and from normal windows.` 时先聚焦该窗口再重试一次。回执会注明 `[created a new Chrome window because none was open]`。
 - **组只复用、不盲目新建**：每次 `newTab/attach` 先实时查询所有打开的 “DSH Agent” 组（优先同窗口），失败时重查一次再决定是否建组；同一窗口的重复组会自动合并，回执带 `groupAction: created|reused` 与 `groupsMerged`。
 - 快照使用 Host 侧 `n<backendNodeId>` refs；动作带 settle/回执。
-- `logs` 支持 `filter`/`clear`；`wait` 支持 selector/text/networkIdle/idleMs/ms（多条件 AND）；`upload` 用 `DOM.setFileInputFiles`。
-- `screenshot {format?, quality?, fullPage?, clip?, ref?, selector?}`：`fullPage`/`clip`/`ref`/`selector` 只能选一种；`clip` 是**视口（CSS px）坐标**，`ref`/`selector` 会先滚动到目标再按视口坐标截取；`fullPage` 临时把仿真视口拉高到内容高度再截、随后恢复。Host 按格式落盘并回填真实像素尺寸。
+- `find {text?, tag?, selector?, limit?}`：页面结构检索（含 closed shadow DOM / 自定义元素），返回 `ref`（可直接 click）、tag/role/name、`rect`+`center`、`shadow: closed|open|none`；`selector` 只匹配 light DOM。用于 snapshot 看不到的元素（如 closed shadow 内部的可点击 `<div>`）。
+- `logs` 支持 `filter`/`clear`；`wait` 支持 selector/text/networkIdle/idleMs/ms（多条件 AND）；`upload` 用 `DOM.setFileInputFiles`（closed shadow 输入框回退 `backendNodeId`）。
+- `screenshot {format?, quality?, fullPage?, clip?, ref?, selector?}`：`fullPage`/`clip`/`ref`/`selector` 只能选一种；`clip` 是**视口（CSS px）坐标**，`ref`/`selector` 会先滚动到目标再按视口坐标截取；`fullPage` 临时把仿真视口拉高到内容高度再截、随后恢复。Chrome 156 后台标签首帧截图偶发不返回，控制器会 4s 后自动重试一次。Host 按格式落盘并回填真实像素尺寸。
 - `emulate {width?, height?, deviceScaleFactor?, mobile?, colorScheme?, reset?}`：CDP device metrics + `prefers-color-scheme` 仿真，按 tab 记录，detach/关闭/reset 自动复位。
 - iframe：内容带 `(iframe)` 标记；点击在 frame 隔离世界中按可访问名执行 `.click()`。
 - 命令在扩展服务端**串行执行**（`background.js` 维护一条 promise 队列）：agent 并发发起多个工具调用时，同一个 tab 上的 CDP 命令不会互相踩踏（真机上并发 selector/clip 截图曾让其中一个永久挂住）。
@@ -80,7 +82,7 @@ Chrome 会在**窗口关闭时把带标题的标签组存为 saved tab group**�
 npm test
 ```
 
-测试覆盖 WebSocket 握手/安全与状态快照、Host 工具往返与 status/窗口诊断（windowState/lastError/失败 hint/空 tabs 重试）、turn 收尾自动 detach 协调器、扩展 controller（含无窗口自愈、detachAll、组复用/合并/ACL、Chrome 156 分组怪癖重试、截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
+测试覆盖 WebSocket 握手/安全与状态快照、Host 工具往返与 status/窗口诊断（windowState/lastError/失败 hint/空 tabs 重试）、turn 收尾自动 detach 协调器、扩展 controller（含无窗口自愈、detachAll、closed shadow 救援/find、截图重试、组复用/合并/ACL、Chrome 156 分组怪癖重试、截图参数 / CDP 仿真 / networkIdle / 自动复位）、manifest 与 CRX 打包。
 
 ## License
 
